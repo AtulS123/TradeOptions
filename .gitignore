@@ -36,3 +36,5 @@ logs/
 
 # Project specific
 access_token.txt
+trading_state.json
+src/data/*.csv

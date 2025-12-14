@@ -16,6 +16,8 @@ from strategy_engine.strategy_manager import StrategyManager
 from strategy_engine.strategies.vwap import VWAPStrategy
 from risk.risk_manager import RiskManager
 from state.state_manager import StateManager, JSONStateStore
+from src.broker.paper_broker import PaperBroker
+from src.data.trade_logger import TradeLogger
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +46,10 @@ vwap_strategy = VWAPStrategy() # The Plugin
 
 # Risk Manager (Gatekeeper)
 risk_manager = RiskManager(total_capital=100000.0)
+
+# Execution Layer
+paper_broker = PaperBroker(state_manager, slippage_pct=0.0005) # 0.05%
+trade_logger = TradeLogger()
 
 app = FastAPI()
 
@@ -157,8 +163,138 @@ async def market_data_loop():
             
             # Pass to Orchestrator
             signals = strategy_manager.on_tick(nifty_tick)
+            
+            # --- EXECUTION LOOP ---
             if signals:
-                logger.info(f"SIGNALS GENERATED: {signals}")
+                logger.info(f"SIGNALS RECEIVED: {signals}")
+                
+                for signal in signals:
+                    # Signal: {action: BUY/SELL, tag: 'VWAP', type: 'LONG/SHORT'?}
+                    # Assuming VWAP strategy returns 'action': 'BUY' for Long, 'SELL' for Short?
+                    # Or 'signal': 1/-1?
+                    # Let's align with VWAP strategy from earlier: 
+                    # "signal": "BUY", "reason": ...
+                    
+                    # A. Signal Translation (Intent)
+                    # If Strategy says BUY -> We want CALLS (Bullish)
+                    # If Strategy says SELL -> We want PUTS (Bearish) - assuming 'SELL' means 'Short the Index'
+                    
+                    signal_action = signal.get("action")
+                    intent_type = "CE" if signal_action == "BUY" else "PE"
+                    
+                    # B. Stop & Reverse Check
+                    current_positions = state_manager.state.open_positions
+                    
+                    # Logic: 
+                    # If Intent is CE, close any PE.
+                    # If Intent is PE, close any CE.
+                    
+                    # Identify opposing positions
+                    opposing_type = "PE" if intent_type == "CE" else "CE"
+                    
+                    for sym, pos in list(current_positions.items()):
+                        # Check if position matches opposing type
+                        # We stored 'option_type' in paper-trades endpoint logic, let's assume we store it in State too.
+                        # If not, parse symbol? "NIFTY...CE"
+                        pos_type = pos.get("option_type")
+                        if not pos_type:
+                            if "CE" in sym: pos_type = "CE"
+                            elif "PE" in sym: pos_type = "PE"
+                            
+                        if pos_type == opposing_type:
+                            logger.info(f"STOP & REVERSE: Closing opposing {pos_type} position {sym}")
+                            # Close it
+                            token = pos.get("token")
+                            
+                            # Fetch Exit Price (Slippage handled by Broker)
+                            # We need *real* LTP to pass to Broker? Broker takes 'price' as LTP and applies slippage.
+                            quote = kite.quote([token])
+                            exit_ltp = quote[token]['last_price']
+                            
+                            # Execute Exit
+                            exec_result = paper_broker.place_order(
+                                symbol=sym,
+                                quantity=pos.get("quantity"),
+                                side="SELL",
+                                price=exit_ltp
+                            )
+                            
+                            # Calc Realized PnL
+                            entry_price = pos.get("entry_price")
+                            # Net PnL = (Exit - Entry) * Qty - Costs
+                            # rough pnl for state manager
+                            gross_pnl = (exec_result["average_price"] - entry_price) * pos.get("quantity")
+                            net_pnl = gross_pnl - exec_result["costs"]
+                            
+                            state_manager.update_pnl(net_pnl)
+                            state_manager.close_position(sym)
+                            trade_logger.log_trade(
+                                order_id=exec_result["order_id"],
+                                symbol=sym,
+                                action="SELL",
+                                quantity=pos.get("quantity"),
+                                price=exec_result["average_price"],
+                                slippage=exec_result["slippage"],
+                                costs=exec_result["costs"],
+                                strategy_tag="REVERSAL"
+                            )
+
+                    # C. Strike Selection
+                    # Only open NEW if we don't already hold this side?
+                    # Simplify: If we don't hold Intent Type, Open it.
+                    already_holding = False
+                    for sym, pos in current_positions.items():
+                        if intent_type in sym: 
+                            already_holding = True
+                            break
+                            
+                    if not already_holding:
+                        selected_strike = get_best_strike(option_chain_data, intent_type, 0.55)
+                        
+                        if selected_strike:
+                            # D. Risk Sizing (10% Rule)
+                            entry_ltp = selected_strike["ltp"]
+                            stop_loss_price = entry_ltp * 0.90 # 10% SL
+                            
+                            # Validation
+                            validation = risk_manager.validate_trade_setup(entry_ltp, stop_loss_price, entry_ltp * 1.2) # Target irrelevant for calculation but needed for validation
+                            
+                            if validation["approved"]:
+                                qty = risk_manager.get_target_size(entry_ltp, stop_loss_price)
+                                
+                                if qty >= 25: # Min 1 lot
+                                    # E. Execution
+                                    exec_result = paper_broker.place_order(
+                                        symbol=selected_strike["symbol"],
+                                        quantity=qty,
+                                        side="BUY",
+                                        price=entry_ltp
+                                    )
+                                    
+                                    # F. Persistence
+                                    state_manager.add_position(selected_strike["symbol"], {
+                                        "token": selected_strike["token"],
+                                        "symbol": selected_strike["symbol"],
+                                        "quantity": qty,
+                                        "entry_price": exec_result["average_price"], # Use actual executed price
+                                        "stop_loss": stop_loss_price,
+                                        "target": entry_ltp * 1.2, # Placeholder
+                                        "option_type": intent_type,
+                                        "strategy_name": signal.get("tag", "VWAP"),
+                                        "timestamp": datetime.now().isoformat()
+                                    })
+                                    
+                                    trade_logger.log_trade(
+                                        order_id=exec_result["order_id"],
+                                        symbol=selected_strike["symbol"],
+                                        action="BUY",
+                                        quantity=qty,
+                                        price=exec_result["average_price"],
+                                        slippage=exec_result["slippage"],
+                                        costs=exec_result["costs"],
+                                        strategy_tag=signal.get("tag", "VWAP")
+                                    )
+                                    logger.info(f"ENTRY EXECUTED: {selected_strike['symbol']} Qty: {qty}")
             # ----------------------------
 
             # 2. Select 20 Strikes (10 up, 10 down) around ATM
@@ -188,6 +324,7 @@ async def market_data_loop():
                     pe_token = int(pe_row.iloc[0]['instrument_token'])
                     
                     tokens_to_fetch.extend([ce_token, pe_token])
+                    strike_map[strike] = {
                         'CE': {'token': ce_token, 'symbol': ce_row.iloc[0]['tradingsymbol']},
                         'PE': {'token': pe_token, 'symbol': pe_row.iloc[0]['tradingsymbol']}
                     }

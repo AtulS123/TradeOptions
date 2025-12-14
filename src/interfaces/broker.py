@@ -15,10 +15,10 @@ class IVirtualBroker(ABC):
     @abstractmethod
     def place_order(self, symbol: str, quantity: int, side: str, 
                    product: str, order_type: str, price: float = 0.0, 
-                   trigger_price: float = 0.0) -> str:
+                   trigger_price: float = 0.0) -> Dict[str, Any]:
         """
         Places an order.
-        Returns: Order ID (str)
+        Returns: Order details (Dict)
         """
         pass
 
