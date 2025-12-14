@@ -1,7 +1,7 @@
 import { Card } from "./ui/card";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
-import { TrendingUp, TrendingDown, PlayCircle, StopCircle } from "lucide-react";
+import { TrendingUp, TrendingDown, PlayCircle, StopCircle, XCircle, RefreshCw } from "lucide-react";
 import { useState, useEffect } from "react";
 
 interface PaperTrade {
@@ -18,112 +18,65 @@ interface PaperTrade {
   timestamp: string;
   status: "active" | "stopped";
   strategy: string;
+  pnl: number;
 }
 
 export function PaperTrades() {
-  const [trades, setTrades] = useState<PaperTrade[]>([
-    {
-      id: "1",
-      symbol: "NIFTY",
-      strike: 21600,
-      type: "CE",
-      action: "BUY",
-      quantity: 100,
-      entryPrice: 125.80,
-      currentPrice: 128.40,
-      stopLoss: 115.00,
-      target: 150.00,
-      timestamp: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
-      status: "active",
-      strategy: "Momentum Breakout",
-    },
-    {
-      id: "2",
-      symbol: "NIFTY",
-      strike: 21300,
-      type: "PE",
-      action: "BUY",
-      quantity: 75,
-      entryPrice: 95.50,
-      currentPrice: 92.30,
-      stopLoss: 85.00,
-      target: 110.00,
-      timestamp: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
-      status: "active",
-      strategy: "Mean Reversion",
-    },
-    {
-      id: "3",
-      symbol: "NIFTY",
-      strike: 21500,
-      type: "CE",
-      action: "SELL",
-      quantity: 50,
-      entryPrice: 140.00,
-      currentPrice: 138.20,
-      stopLoss: 155.00,
-      target: 120.00,
-      timestamp: new Date(Date.now() - 1000 * 60 * 20).toISOString(),
-      status: "stopped",
-      strategy: "IV Crush",
-    },
-  ]);
+  const [trades, setTrades] = useState<PaperTrade[]>([]);
+  const [virtualBalance, setVirtualBalance] = useState(100000); // Fixed for now, can be fetched from API later
+  const [isOffline, setIsOffline] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
 
-  const [virtualBalance, setVirtualBalance] = useState(100000);
+  const fetchTrades = async () => {
+    try {
+      const response = await fetch("http://localhost:8000/paper-trades");
+      if (!response.ok) {
+        throw new Error("Network response was not ok");
+      }
+      const data = await response.json();
+      setTrades(data);
+      setIsOffline(false);
+    } catch (error) {
+      console.error("Failed to fetch trades:", error);
+      setIsOffline(true);
+      // Keep old data to prevent flickering
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   useEffect(() => {
-    const interval = setInterval(() => {
-      setTrades((prevTrades) =>
-        prevTrades.map((trade) =>
-          trade.status === "active"
-            ? {
-                ...trade,
-                currentPrice: trade.currentPrice + (Math.random() - 0.5) * 1.5,
-              }
-            : trade
-        )
-      );
-    }, 2000);
+    // Initial fetch
+    fetchTrades();
+
+    // Poll every 1 second
+    const interval = setInterval(fetchTrades, 1000);
 
     return () => clearInterval(interval);
   }, []);
 
-  const calculatePnL = (trade: PaperTrade) => {
-    const multiplier = trade.action === "BUY" ? 1 : -1;
-    return (
-      multiplier *
-      (trade.currentPrice - trade.entryPrice) *
-      trade.quantity
-    );
-  };
-
-  const calculatePnLPercent = (trade: PaperTrade) => {
-    const multiplier = trade.action === "BUY" ? 1 : -1;
-    return (
-      (multiplier * (trade.currentPrice - trade.entryPrice) * 100) /
-      trade.entryPrice
-    );
-  };
-
-  const toggleTradeStatus = (id: string) => {
-    setTrades(
-      trades.map((t) =>
-        t.id === id
-          ? {
-              ...t,
-              status: t.status === "active" ? "stopped" : "active",
-            }
-          : t
-      )
-    );
-  };
+  const handleClosePosition = async (token: string) => {
+    try {
+      const response = await fetch(`http://localhost:8000/trade/${token}`, {
+        method: 'DELETE'
+      });
+      if (response.ok) {
+        // Immediate optimistic UI update (optional, or just wait for next poll)
+        fetchTrades();
+      } else {
+        alert("Failed to close position");
+      }
+    } catch (e) {
+      alert("Error closing position");
+    }
+  }
 
   const getTotalPnL = () => {
-    return trades.reduce((acc, trade) => acc + calculatePnL(trade), 0);
+    return trades.reduce((acc, trade) => acc + (trade.pnl || 0), 0);
   };
 
   const getActiveTrades = () => {
-    return trades.filter((t) => t.status === "active").length;
+    return trades.length; // API returns active only
   };
 
   return (
@@ -135,41 +88,47 @@ export function PaperTrades() {
         </Card>
         <Card className="p-4">
           <div className="text-sm text-muted-foreground">
-            Active Simulations
+            Active Simulator
           </div>
-          <div>{getActiveTrades()}</div>
+          <div className="flex items-center gap-2">
+            {getActiveTrades()}
+            {isOffline && <Badge variant="destructive" className="ml-2">Offline</Badge>}
+          </div>
         </Card>
         <Card className="p-4">
           <div className="text-sm text-muted-foreground">Total P&L</div>
           <div
-            className={`${
-              getTotalPnL() >= 0 ? "text-green-600" : "text-red-600"
-            }`}
+            className={`${getTotalPnL() >= 0 ? "text-green-600" : "text-red-600"
+              } font-bold`}
           >
-            ₹{getTotalPnL().toFixed(2)}
+            ₹{getTotalPnL().toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </div>
         </Card>
       </div>
 
       <div className="space-y-3">
+        {trades.length === 0 && !isOffline && (
+          <Card className="p-8 flex flex-col items-center justify-center text-muted-foreground">
+            <p>No active live trades.</p>
+          </Card>
+        )}
+
         {trades.map((trade) => {
-          const pnl = calculatePnL(trade);
-          const pnlPercent = calculatePnLPercent(trade);
-          const isProfit = pnl >= 0;
+          const isProfit = (trade.pnl || 0) >= 0;
+          const pnlPercent = (trade.pnl / (trade.entryPrice * trade.quantity)) * 100;
 
           return (
             <Card
               key={trade.id}
-              className={`p-4 ${
-                trade.status === "stopped" ? "opacity-60" : ""
-              }`}
+              className={`p-4 transition-all duration-200 ${isOffline ? "opacity-50" : ""
+                }`}
             >
               <div className="flex items-start justify-between mb-3">
                 <div className="flex items-center gap-2">
                   <div>
                     <div className="flex items-center gap-2">
-                      <span>
-                        {trade.symbol} {trade.strike} {trade.type}
+                      <span className="font-semibold">
+                        {trade.symbol}
                       </span>
                       <Badge
                         variant={
@@ -187,36 +146,33 @@ export function PaperTrades() {
                   </div>
                 </div>
                 <Button
-                  variant="ghost"
+                  variant="destructive"
                   size="sm"
-                  onClick={() => toggleTradeStatus(trade.id)}
+                  onClick={() => handleClosePosition(trade.id)}
+                  className="hover:bg-red-600"
                 >
-                  {trade.status === "active" ? (
-                    <StopCircle className="size-4" />
-                  ) : (
-                    <PlayCircle className="size-4" />
-                  )}
+                  <XCircle className="size-4 mr-1" />
+                  Close
                 </Button>
               </div>
 
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-3">
                 <div>
                   <div className="text-sm text-muted-foreground">LTP</div>
-                  <div>₹{trade.currentPrice.toFixed(2)}</div>
+                  <div className="font-mono">₹{trade.currentPrice.toFixed(2)}</div>
                 </div>
                 <div>
                   <div className="text-sm text-muted-foreground">P&L</div>
                   <div
-                    className={`flex items-center gap-1 ${
-                      isProfit ? "text-green-600" : "text-red-600"
-                    }`}
+                    className={`flex items-center gap-1 font-mono font-medium ${isProfit ? "text-green-600" : "text-red-600"
+                      }`}
                   >
                     {isProfit ? (
                       <TrendingUp className="size-4" />
                     ) : (
                       <TrendingDown className="size-4" />
                     )}
-                    ₹{pnl.toFixed(2)} ({pnlPercent.toFixed(2)}%)
+                    ₹{trade.pnl.toFixed(2)} ({pnlPercent.toFixed(2)}%)
                   </div>
                 </div>
                 <div>
@@ -227,16 +183,15 @@ export function PaperTrades() {
                 </div>
                 <div>
                   <div className="text-sm text-muted-foreground">Status</div>
-                  <Badge
-                    variant={trade.status === "active" ? "default" : "outline"}
-                  >
-                    {trade.status}
+                  <Badge variant="default" className="bg-green-500 hover:bg-green-600">
+                    Active
                   </Badge>
                 </div>
               </div>
 
-              <div className="text-xs text-muted-foreground">
-                {new Date(trade.timestamp).toLocaleString()}
+              <div className="text-xs text-muted-foreground flex justify-between">
+                <span>{new Date(trade.timestamp).toLocaleString()}</span>
+                {isOffline && <span className="text-red-400 flex items-center gap-1"><RefreshCw className="w-3 h-3 animate-spin" /> Reconnecting...</span>}
               </div>
             </Card>
           );
