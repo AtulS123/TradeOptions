@@ -21,6 +21,47 @@ class VWAPStrategy(BaseStrategy):
         # Parameters
         self.volume_multiplier = 1.5
         
+    def seed_candles(self, historical_df: pd.DataFrame):
+        """
+        Hydrates the strategy with historical 1-minute data to fix Cold Start VWAP issues.
+        
+        Args:
+            historical_df: DF with columns ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        """
+        if historical_df.empty:
+            return
+
+        logger.info(f"Seeding VWAP with {len(historical_df)} candles...")
+        
+        # Ensure timestamp is datetime
+        historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
+        
+        # 1. Reset Candles
+        self.candles = historical_df.copy().sort_values('timestamp').reset_index(drop=True)
+        
+        # 2. Re-calculate indicators logic
+        # We need 'start_cum_vol' for the current candle logic, but for historical
+        # we can just assume the provided volume IS the 1-min volume.
+        
+        # 3. Recalculate VWAP from the start of this DF
+        # Assuming the DF starts from 9:15 AM today.
+        
+        price = self.candles['close']
+        vol = self.candles['volume']
+        
+        # VWAP Calculation
+        self.candles['cum_pairs'] = (price * vol).cumsum()
+        self.candles['cum_vol'] = vol.cumsum()
+        self.candles['vwap'] = self.candles['cum_pairs'] / self.candles['cum_vol']
+        
+        # EMA
+        self.candles['ema_20'] = self.candles['close'].ewm(span=20, adjust=False).mean()
+        
+        # Vol SMA
+        self.candles['vol_sma_20'] = self.candles['volume'].rolling(window=20).mean()
+        
+        logger.info(f"VWAP Seeded. Last VWAP: {self.candles.iloc[-1]['vwap']:.2f}")
+
     @property
     def name(self) -> str:
         return self._name

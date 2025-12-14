@@ -420,10 +420,6 @@ async def startup_event():
     
     logger.info(f"System Rehydrated. Daily PnL: {current_state.daily_pnl}, Open Pos: {len(current_state.open_positions)}")
     
-    # Plug the Strategy
-    # To "Turn Off", just comment out this line:
-    strategy_manager.register_strategy(vwap_strategy)
-    
     logger.info("Connecting to Kite Connect...")
     try:
         kite = KiteConnect(api_key=API_KEY)
@@ -452,6 +448,48 @@ async def startup_event():
         instrument_df = df[df['expiry'] == nearest_expiry]
         logger.info(f"Loaded {len(instrument_df)} contracts for {nearest_expiry}")
         
+        # --- VWAP COLD START FIX ---
+        # Get NIFTY 50 Token
+        # Need to query instruments for NSE:NIFTY 50 to get token
+        # We can optimize by fetching 'NSE' instruments or just hardcoding/searching.
+        # But 'kite.instruments("NSE")' is heavy.
+        # Let's search 'spot_quote' logic later? No, we need it now.
+        # Actually, we can fetch the token from 'quote' if we don't have it, but for historical we need token.
+        # Efficient way: quote first.
+        
+        try:
+            spot_q = kite.quote(["NSE:NIFTY 50"])
+            nifty_token = spot_q["NSE:NIFTY 50"]["instrument_token"]
+            
+            logger.info(f"Fetching Historical Data for VWAP Seeding (Token: {nifty_token})...")
+            
+            # Fetch for today from 9:15 AM
+            today_start = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
+            now = datetime.now()
+            
+            if now > today_start:
+                historical_data = kite.historical_data(
+                    nifty_token, 
+                    from_date=today_start, 
+                    to_date=now, 
+                    interval="minute"
+                )
+                
+                # Convert to DF
+                hist_df = pd.DataFrame(historical_data)
+                
+                # Seed VWAP (Register strategy first!)
+                strategy_manager.register_strategy(vwap_strategy) # Plug IN before seeding
+                vwap_strategy.seed_candles(hist_df)
+            else:
+                logger.info("Market not open yet, skipping VWAP seed.")
+                strategy_manager.register_strategy(vwap_strategy)
+
+        except Exception as e:
+            logger.error(f"Failed to seed VWAP: {e}")
+            # Ensure strategy registered even if seed fails
+            strategy_manager.register_strategy(vwap_strategy)
+
         # Start background task
         asyncio.create_task(market_data_loop())
         
@@ -594,40 +632,28 @@ def close_trade_manual(token: int):
     state = state_manager.get_state()
     # Find active position by token
     target_symbol = None
-    target_details = None
     
     for sym, details in state.open_positions.items():
         if int(details.get("token", 0)) == token:
             target_symbol = sym
-            target_details = details
             break
             
     if not target_symbol:
         return {"status": "error", "message": "Trade not found"}
 
-    # 1. Fetch Exit Price
+    # Use PaperBroker to close (Handles PnL, State, Logging)
     try:
+        # We need current Price for accurate PnL record in Manual Close
+        # Broker close_position takes 'price' as the market price to execute at.
         quote = kite.quote([token])
         exit_price = quote[token]['last_price']
-    except:
-        exit_price = target_details.get("entry_price") # Fallback to breakeven if fetch fails? Or 0? Better BE.
-    
-    # 2. Calc Realized PnL
-    qty = target_details.get("quantity", 0)
-    entry = target_details.get("entry_price", 0)
-    pnl = (exit_price - entry) * qty
-    
-    # 3. Update PnL
-    state_manager.update_pnl(pnl)
-    
-    # 4. Remove Position
-    state_manager.close_position(target_symbol)
-    
-    # 5. Notify Strategy (Manual Exit)
-    strategy_manager.force_exit(token)
-    
-    logger.info(f"Manual Close: {target_symbol}, PnL: {pnl}")
-    return {"status": "success", "closed_at": exit_price, "pnl": pnl}
+        
+        result = paper_broker.close_position(target_symbol, price=exit_price, reason="Manual API Close")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Manual Close Error: {e}")
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     import uvicorn

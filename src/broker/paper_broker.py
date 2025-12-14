@@ -25,13 +25,13 @@ class PaperBroker(IVirtualBroker):
 
     def place_order(self, symbol: str, quantity: int, side: str, 
                    product: str = "MIS", order_type: str = "MARKET", 
-                   price: float = 0.0, trigger_price: float = 0.0) -> Dict[str, Any]:
+                   price: float = 0.0, trigger_price: float = 0.0,
+                   stop_loss: float = 0.0, target: float = 0.0, 
+                   strategy_tag: str = "MANUAL", token: int = 0) -> Dict[str, Any]:
         """
-        Executes a paper trade with simulated realism.
-        Returns: {order_id, executed_price, costs, slippage, ...}
+        Executes a paper trade with simulated realism and ATOMIC persistence.
         """
         # 1. Simulate Slippage
-        # If BUY, we pay MORE. If SELL, we get LESS.
         slippage = 0.0
         executed_price = price
         
@@ -50,38 +50,31 @@ class PaperBroker(IVirtualBroker):
         )
 
         order_id = f"PAPER-{uuid.uuid4().hex[:8]}"
+        timestamp = datetime.now().isoformat()
         
         logger.info(f"Simulated Fill: {quantity} {symbol} @ {round(executed_price, 2)} (Slippage: {round(slippage, 2)}, Costs: {costs})")
         
-        # 3. Persist to StateManager? 
-        # The user requested 'Accept StateManager instance to persist trades.'
-        # If BUY (Opening), we add to State.
-        # If SELL (Closing), we don't necessarily 'remove' here in this specific method call unless strictly instructed, 
-        # but the main loop logic relied on main.py handling the reversal logic.
-        # HOWEVER, the objective is "Stop handling paper trades manually in main.py".
-        # So we should probably handle state updates here.
-        # But 'place_order' is generic. How do we know if it's open or close?
-        # Typically:
-        # Buy -> Open (if Long only)
-        # Sell -> Close (if Long only)
-        # Assuming simple Long-only Options Strategy for now.
-        
-        # If side == BUY, Add Position
+        # 3. ATOMIC PERSISTENCE (Sole Authority)
         if side == "BUY":
-             # We need 'token'? The generic place_order interface takes 'symbol'.
-             # Ideally we pass token too using **kwargs or similar if we strictly follow interface.
-             # But 'symbol' in our system is "NIFTY ...". 
-             # We can let main.py verify the token or update add_position to be symbol-based.
-             # Main loop passes token to Add Position.
-             pass # Main loop Logic seems to handle 'add_position' with rich metadata (token, strategy name).
-             # It's hard to move ALL persistence here without passing extra args.
-             # For now, we will stick to Broker returning execution details, and main.py (The loop) updating StateManager with rich context.
-             # BUT, the prompt said "Stop handling paper trades manually in main.py".
-             # Maybe just the 'Price Calculation' and 'Params' part? 
-             # Let's trust the Broker to be the source of truth for POSITIONS?
-             # "The Broker is the only component allowed to say whether a position is open or closed."
-             # This implies Broker manages self.positions.
-             pass
+            # Opening a Position
+            # We assume BUY = OPEN for Long Options interactions
+            self.state_manager.add_position(symbol, {
+                "token": token,
+                "symbol": symbol,
+                "quantity": quantity,
+                "entry_price": round(executed_price, 2),
+                "stop_loss": stop_loss, # Persisted!
+                "target": target,       # Persisted!
+                "option_type": "CE" if "CE" in symbol else "PE", # Inference fallback
+                "strategy_name": strategy_tag,
+                "timestamp": timestamp,
+                "strike": 0 # TODO: Pass strike if needed, currently inferred or irrelevant for basic pnl
+            })
+        
+        # Note: SELL side persistence is handled via 'close_position' method usually.
+        # But if 'place_order' (SELL) is called directly, we might want to handle it?
+        # For now, we enforce using 'close_position' for Exits to ensure PnL calc is correct.
+        # But if 'place_order' is used for SELL, it's just an execution event log.
 
         return {
             "order_id": order_id,
@@ -92,7 +85,51 @@ class PaperBroker(IVirtualBroker):
             "average_price": round(executed_price, 2),
             "slippage": round(slippage, 2),
             "costs": round(costs, 2),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": timestamp
+        }
+
+    def close_position(self, symbol: str, price: float = 0.0, reason: str = "Signal") -> Dict[str, Any]:
+        """
+        Atomically closes a position and updates State & PnL.
+        """
+        # 1. Fetch State
+        pos = self.state_manager.state.open_positions.get(symbol)
+        if not pos:
+            logger.warning(f"Attempted to close non-existent position: {symbol}")
+            return {"status": "error", "message": "Position not found"}
+
+        qty = pos.get("quantity", 0)
+        entry_price = pos.get("entry_price", 0.0)
+
+        # 2. Execute via Internal Order (for costs/slippage)
+        # We pass side="SELL"
+        exec_result = self.place_order(
+            symbol=symbol,
+            quantity=qty,
+            side="SELL",
+            price=price
+        )
+        
+        exit_price = exec_result["average_price"]
+        exit_costs = exec_result["costs"]
+        
+        # 3. Calculate Realized PnL
+        gross_pnl = (exit_price - entry_price) * qty
+        net_pnl = gross_pnl - exit_costs
+        
+        # 4. Update State (Atomic)
+        self.state_manager.update_pnl(net_pnl)
+        self.state_manager.close_position(symbol)
+        
+        logger.info(f"Position Closed: {symbol} | Net PnL: {round(net_pnl, 2)} | Reason: {reason}")
+        
+        return {
+            "status": "closed",
+            "symbol": symbol,
+            "exit_price": exit_price,
+            "net_pnl": net_pnl,
+            "reason": reason,
+            "order_details": exec_result
         }
 
     def get_pnl(self, symbol: str, current_ltp: float) -> float:
