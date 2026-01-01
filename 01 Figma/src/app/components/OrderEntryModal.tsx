@@ -17,7 +17,7 @@ interface OrderEntryModalProps {
 
 export function OrderEntryModal({ isOpen, onClose, symbol, ltp, type }: OrderEntryModalProps) {
     const [side, setSide] = useState<"BUY" | "SELL">("BUY");
-    const [orderType, setOrderType] = useState<"MARKET" | "LIMIT" | "SL">("MARKET");
+    const [orderType, setOrderType] = useState<"MARKET" | "LIMIT" | "SL" | "SL-M">("MARKET");
     const [product, setProduct] = useState<"MIS" | "NRML">("MIS");
 
     const [lots, setLots] = useState<string>("1");
@@ -62,8 +62,8 @@ export function OrderEntryModal({ isOpen, onClose, symbol, ltp, type }: OrderEnt
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     symbol,
-                    ltp: limitPrice,
                     quantity: qty,
+                    price: limitPrice,
                     product,
                     side
                 })
@@ -113,7 +113,7 @@ export function OrderEntryModal({ isOpen, onClose, symbol, ltp, type }: OrderEnt
             });
 
             const data = await res.json();
-            if (data.status === "success") {
+            if (data.status === "success" || data.status === "pending") {
                 onClose();
                 // We should trigger a refresh in parent, but for now just close
             } else {
@@ -132,8 +132,13 @@ export function OrderEntryModal({ isOpen, onClose, symbol, ltp, type }: OrderEnt
         <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
             <DialogContent className="sm:max-w-[400px]">
                 <DialogHeader>
-                    <div className="flex justify-between items-center">
-                        <DialogTitle>{symbol}</DialogTitle>
+                    <div className="flex justify-between items-center mb-2">
+                        <div className="flex items-center gap-2">
+                            <DialogTitle>{symbol}</DialogTitle>
+                            <div className="bg-purple-100 text-purple-700 text-[10px] px-2 py-0.5 rounded border border-purple-200 font-bold uppercase tracking-wider">
+                                Paper Trade
+                            </div>
+                        </div>
                         <span className={`text-sm font-bold ${ltp > 0 ? "text-green-600" : ""}`}>
                             {ltp.toFixed(2)}
                         </span>

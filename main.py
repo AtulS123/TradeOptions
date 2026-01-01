@@ -18,6 +18,7 @@ from risk.risk_manager import RiskManager
 from state.state_manager import StateManager, JSONStateStore
 from src.broker.paper_broker import PaperBroker
 from src.data.trade_logger import TradeLogger
+from src.utils.market_schedule import get_market_state_label
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +34,7 @@ kite: Optional[KiteConnect] = None
 instrument_df: Optional[pd.DataFrame] = None
 nifty_token: Optional[int] = None
 option_chain_data: List[Dict] = []
-market_status = {"status": "Disconnected", "nifty_price": 0.0, "pcr": 0.0}
+market_status = {"status": "Disconnected", "nifty_price": 0.0, "pcr": 0.0, "market_label": "Closed"}
 is_server_running = True
 
 # State Persistence
@@ -154,6 +155,7 @@ async def market_data_loop():
             nifty_ltp = spot_quote["NSE:NIFTY 50"]["last_price"]
             market_status["nifty_price"] = nifty_ltp
             market_status["status"] = "Connected"
+            market_status["market_label"] = get_market_state_label()
 
             # --- Strategy Integration ---
             # Simulate a 'Tick' from the quote (Polling -> Tick Adapter)
@@ -590,7 +592,26 @@ def get_system_state():
     """
     return state_manager.get_state()
 
-@app.get("/paper-trades")
+class MarginRequest(BaseModel):
+    symbol: str
+    quantity: int
+    price: float
+    product: str = "MIS"
+    side: str = "BUY"
+
+@app.post("/api/check-margin")
+def check_margin_endpoint(req: MarginRequest):
+    """
+    Paper Trading - Always approve sufficient margin or simulate logic.
+    """
+    required = req.price * req.quantity
+    available = 1000000.0 # Mock Capital
+    return {
+        "status": "success",
+        "required_margin": required,
+        "available_margin": available,
+        "shortfall": 0.0
+    }
 def get_paper_trades():
     """
     Returns active paper trades with live P&L.
@@ -656,6 +677,27 @@ def get_paper_trades():
 
     return positions
 
+@app.delete("/api/orders/{order_id}")
+def delete_order_endpoint(order_id: str):
+    """
+    Manually cancels/removes an order from the system.
+    """
+    try:
+        # 1. Attempt to Cancel at Broker (PaperBroker)
+        if hasattr(paper_broker, 'cancel_order'):
+            paper_broker.cancel_order(order_id)
+            
+        # 2. Remove from State
+        success = state_manager.delete_order(order_id)
+        if success:
+            return {"status": "success", "message": f"Order {order_id} removed"}
+        else:
+            return {"status": "error", "message": "Order not found"}
+            
+    except Exception as e:
+        logger.error(f"Delete Order Failed: {e}")
+        return {"status": "error", "message": str(e)}
+
 @app.delete("/trade/{token}")
 def close_trade_manual(token: int):
     """
@@ -687,67 +729,52 @@ def close_trade_manual(token: int):
         logger.error(f"Manual Close Error: {e}")
         return {"status": "error", "message": str(e)}
 
-@app.post("/manual-trade")
-def place_manual_trade(type: str = "CE", quantity: Optional[int] = None):
+# --- Order Placement API (JSON Support) ---
+class PlaceOrderRequest(BaseModel):
+    symbol: str
+    quantity: int
+    side: str = "BUY"
+    product: str = "MIS"
+    order_type: str = "MARKET"
+    price: float = 0.0
+    trigger_price: float = 0.0
+    ltp: float = 0.0
+
+@app.post("/api/place-order")
+def place_order_endpoint(request: PlaceOrderRequest):
     """
-    Manually triggers a paper trade for the best strike.
+    Unified endpoint for placing paper trades via JSON payload.
+    Compatible with OrderEntryModal.
     """
-    global option_chain_data, market_status
+    global option_chain_data
     
-    # 1. Get Market Context
-    if market_status["nifty_price"] == 0:
-        return {"status": "error", "message": "Market data not yet available"}
-        
-    s = market_status["nifty_price"]
+    # 1. Execute via PaperBroker
+    # Note: request.symbol is passed directly (e.g. "NIFTY 25650 CE")
     
-    # 2. Select Strike (ATM)
-    # Reuse simple logic or get_best_strike
-    # Let's use get_best_strike with Delta ~0.5 (ATM)
-    target_strike = get_best_strike(option_chain_data, type, 0.55) 
-    
-    if not target_strike:
-         return {"status": "error", "message": "No suitable strike found"}
-         
-    entry_ltp = target_strike["ltp"]
-    stop_loss = entry_ltp * 0.90
-    
-    # 3. Sizing
-    if quantity:
-        qty = quantity
-    else:
-        qty = risk_manager.get_target_size(entry_ltp, stop_loss)
-        if qty < 25: qty = 25 # Min 1 lot
-        
-    # 4. Execute
     try:
+        # Determine specific details if needed, but PaperBroker handles execution logic
         exec_result = paper_broker.place_order(
-            symbol=target_strike["symbol"],
-            quantity=qty,
-            side="BUY",
-            price=entry_ltp
+            symbol=request.symbol,
+            quantity=request.quantity,
+            side=request.side,
+            product=request.product,
+            order_type=request.order_type,
+            price=request.price if request.order_type != "MARKET" else request.ltp, # Use LTP for Market if 0 passed
+            trigger_price=request.trigger_price,
+            strategy_tag="MANUAL_UI"
         )
         
-        # 5. Persist
-        state_manager.add_position(target_strike["symbol"], {
-            "token": target_strike["token"],
-            "symbol": target_strike["symbol"],
-            "quantity": qty,
-            "entry_price": exec_result["average_price"],
-            "stop_loss": stop_loss,
-            "target": entry_ltp * 1.2,
-            "option_type": type,
-            "strategy_name": "MANUAL",
-            "timestamp": datetime.now().isoformat()
-        })
+        return {"status": "success", "data": exec_result}
         
-        return {
-            "status": "success", 
-            "trade": exec_result,
-            "strike": target_strike["symbol"]
-        }
     except Exception as e:
-        logger.error(f"Manual Trade Failed: {e}")
+        logger.error(f"Order Placement Failed: {e}")
         return {"status": "error", "message": str(e)}
+
+# Legacy endpoint redirect or keep for simple tests
+@app.post("/manual-trade")
+def place_manual_trade_legacy(type: str = "CE", quantity: int = 50):
+    # Adapter to new logic logic or keep simple
+    pass # ... (Simplification: Removing old one to avoid confusion, user uses Modal now)
 
 
 # --- Backtest API ---

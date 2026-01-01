@@ -29,11 +29,13 @@ class BacktestBroker(IVirtualBroker):
         order_id = f"BT-{len(self.trades) + 1}"
         
         # Update Internal State
+        # Record for Return
+        pnl_record = 0.0
+
         if side == "BUY":
             # OPEN Position (Assuming Long only for options for now)
             if symbol in self.active_positions:
-                # Average up? Or separate? 
-                # For simplicity, average up.
+                # Average up
                 curr = self.active_positions[symbol]
                 total_cost = (curr["entry_price"] * curr["quantity"]) + (executed_price * quantity)
                 new_qty = curr["quantity"] + quantity
@@ -62,6 +64,7 @@ class BacktestBroker(IVirtualBroker):
                 # Realize PnL
                 pnl = (executed_price - curr["entry_price"]) * quantity
                 self.capital += pnl
+                pnl_record = pnl
                 
                 if remaining <= 0:
                     del self.active_positions[symbol]
@@ -74,7 +77,8 @@ class BacktestBroker(IVirtualBroker):
             "side": side,
             "quantity": quantity,
             "price": executed_price,
-            "strategy": strategy_tag
+            "strategy": strategy_tag,
+            "pnl": pnl_record if side == "SELL" else 0.0
         }
         self.trades.append(trade_record)
         

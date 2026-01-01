@@ -199,21 +199,21 @@ export function PaperTrades() {
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                   <div>
                     <div className="text-sm text-muted-foreground">Qty / Entry</div>
-                    <div>{trade.quantity} @ ₹{trade.entryPrice.toFixed(2)}</div>
+                    <div>{trade.quantity} @ ₹{(trade.entryPrice || 0).toFixed(2)}</div>
                   </div>
                   <div>
                     <div className="text-sm text-muted-foreground">Current Price</div>
-                    <div className="font-mono font-bold">₹{trade.currentPrice.toFixed(2)}</div>
+                    <div className="font-mono font-bold">₹{(trade.currentPrice || 0).toFixed(2)}</div>
                   </div>
                   <div>
                     <div className="text-sm text-muted-foreground">P&L</div>
                     <div className={`font-mono font-bold ${isProfit ? "text-green-600" : "text-red-600"}`}>
-                      {isProfit ? "+" : ""}₹{trade.pnl.toFixed(2)} ({pnlPercent.toFixed(2)}%)
+                      {isProfit ? "+" : ""}₹{(trade.pnl || 0).toFixed(2)} ({isNaN(pnlPercent) ? "0.00" : pnlPercent.toFixed(2)}%)
                     </div>
                   </div>
                   <div>
                     <div className="text-sm text-muted-foreground">Stop Loss</div>
-                    <div className="text-red-500">₹{trade.stopLoss.toFixed(2)}</div>
+                    <div className="text-red-500">₹{(trade.stopLoss || 0).toFixed(2)}</div>
                   </div>
                 </div>
               </Card>
@@ -247,7 +247,11 @@ export function PaperTrades() {
                       <Badge variant={o.side === "BUY" ? "default" : "secondary"}>{o.side}</Badge>
                     </TableCell>
                     <TableCell>{o.quantity}</TableCell>
-                    <TableCell>{o.status === "EXECUTED" ? o.average_price.toFixed(2) : o.price}</TableCell>
+                    <TableCell>
+                      {o.status === "EXECUTED"
+                        ? (o.average_price || o.price || 0).toFixed(2)
+                        : (o.price || 0).toString()}
+                    </TableCell>
                     <TableCell>
                       <Badge variant={o.status === "EXECUTED" ? "outline" : "secondary"} className={o.status === "EXECUTED" ? "bg-green-50 text-green-700 border-green-200" : "bg-yellow-50 text-yellow-700 border-yellow-200"}>
                         {o.status}

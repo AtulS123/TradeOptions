@@ -13,7 +13,32 @@ import {
   BarChart3,
 } from "lucide-react";
 
+import { useState, useEffect } from "react";
+
 export default function App() {
+  const [marketLabel, setMarketLabel] = useState<string>("Closed");
+
+  useEffect(() => {
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch("http://localhost:8000/market-status");
+        if (res.ok) {
+          const data = await res.json();
+          // Backend returns { market_label: "Open" | "Closed", ... }
+          if (data.market_label) {
+            setMarketLabel(data.market_label);
+          }
+        }
+      } catch (e) {
+        console.error("Failed to fetch market status", e);
+      }
+    };
+
+    fetchStatus(); // Initial fetch
+    const interval = setInterval(fetchStatus, 30000); // Poll every 30s
+    return () => clearInterval(interval);
+  }, []);
+
   return (
     <div className="min-h-screen bg-background">
       <div className="border-b">
@@ -30,10 +55,17 @@ export default function App() {
             </div>
             <Card className="p-3">
               <div className="text-sm text-muted-foreground">Market Status</div>
-              <div className="flex items-center gap-2 text-green-600">
-                <div className="size-2 rounded-full bg-green-500 animate-pulse" />
-                Open
-              </div>
+              {marketLabel === "Open" ? (
+                <div className="flex items-center gap-2 text-green-600">
+                  <div className="size-2 rounded-full bg-green-500 animate-pulse" />
+                  Open
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-red-600">
+                  <div className="size-2 rounded-full bg-red-500" />
+                  Closed
+                </div>
+              )}
             </Card>
           </div>
         </div>

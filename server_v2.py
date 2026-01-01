@@ -525,7 +525,8 @@ async def startup_event():
             strategy_manager.register_strategy(vwap_strategy)
 
         # Start background task
-        asyncio.create_task(market_data_loop())
+        # asyncio.create_task(market_data_loop())
+        pass
         
     except Exception as e:
         logger.error(f"Startup failed: {e}")
@@ -687,6 +688,80 @@ class OrderRequest(BaseModel):
     product: str = "MIS"
     side: str = "BUY"  # BUY / SELL
 
+    side: str = "BUY"  # BUY / SELL
+
+    side: str = "BUY"  # BUY / SELL
+
+class StrategyConfig(BaseModel):
+    # Strategy Logic
+    strategy_type: str = "Short Straddle"
+    underlying: str = "NIFTY 50"
+    strike_selection: str = "ATM"  # ATM, ITM, OTM
+    entry_days: List[str] = ["All Days"] # ["Monday", "Thursday"]
+    
+    # Entry & Exit Rules
+    entry_time: str = "09:20"  # HH:MM
+    exit_time: str = "15:15"
+    target_profit_pct: float = 0.0 # 0 = Disable
+    stop_loss_pct: float = 0.0
+    spot_condition: str = "Any" # "Above SMA20", etc.
+
+class RiskConfig(BaseModel):
+    capital: float = 100000.0
+    position_sizing: str = "Fixed Lots" # "Fixed Lots", "% Capital", "Kelly"
+    risk_per_trade_pct: float = 1.0
+    max_slippage_pct: float = 0.5
+    commission_per_lot: float = 20.0
+
+class BacktestRequest(BaseModel):
+    strategy_config: StrategyConfig
+    risk_config: RiskConfig
+    start_date: str
+    end_date: str
+    timeframe: str = "1m"
+    data_source: str = "CSV" 
+
+@app.post("/api/backtest/run")
+def run_backtest(req: BacktestRequest):
+    """
+    Executes a Real Backtest using Module B & C.
+    """
+    logger.info(f"BACKTEST REQUEST: {req}")
+    
+    try:
+        # 1. Init Runner
+        # 1. Init Runner
+        # 1. Init Runner
+        from src.backtest_runner import BacktestRunner
+        from strategy_engine.strategies.vwap import VWAPStrategy # Default for now
+        
+        runner = BacktestRunner(initial_capital=req.risk_config.capital)
+        strategy = VWAPStrategy() # We can switch based on req.strategy_config.strategy_type later
+        
+        # 2. Run
+        print("DEBUG: Calling runner.run()")
+        result = runner.run(
+            strategy=strategy,
+            start_date=req.start_date,
+            end_date=req.end_date,
+            entry_time_str=req.strategy_config.entry_time,
+            exit_time_str=req.strategy_config.exit_time,
+            stop_loss_pct=req.strategy_config.stop_loss_pct,
+            target_profit_pct=req.strategy_config.target_profit_pct
+        )
+        
+        # 3. Return (Result structure already matches via PerformanceAnalytics)
+        if "error" in result:
+             return {"status": "error", "message": result["error"]}
+             
+        return {"status": "success", "data": result}
+        
+    except Exception as e:
+        logger.error(f"Backtest Execution Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
 class MarginRequest(BaseModel):
     symbol: str
     quantity: int
@@ -775,31 +850,49 @@ def place_order_endpoint(order: OrderRequest):
              except:
                  pass
                  
-        # 3. Execution Logic
-        exec_price = order.price
+        # 3. Market Hours Check (Simple 9:15-15:30 check)
+        now = datetime.now()
+        start_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        end_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        is_market_open = start_time <= now <= end_time
         
-        if order.order_type == "MARKET":
-             if current_ltp > 0:
-                exec_price = current_ltp
-                status = "EXECUTED"
+        # Override for weekends/holidays if needed, but time check is good start
+        if not is_market_open:
+             if order.order_type == "MARKET":
+                 status = "REJECTED"
+                 msg = "Market is Closed (9:15-15:30). Use LIMIT orders for offline testing."
              else:
-                status = "REJECTED"
-                msg = "Market Price Unavailable (Market Closed?)"
-            
-        elif order.order_type == "LIMIT":
-            if order.side == "BUY" and current_ltp > 0 and current_ltp <= order.price:
-                exec_price = order.price 
-                status = "EXECUTED"
-            elif order.side == "SELL" and current_ltp > 0 and current_ltp >= order.price:
-                exec_price = order.price
-                status = "EXECUTED"
-            else:
-                status = "PENDING"
-                msg = "Limit Price not reached"
+                 # LIMIT Orders stay PENDING if market is closed
+                 status = "PENDING"
+                 msg = "Market Closed. Order queued."
 
-        # 4. Broker Call (If Executed)
+        # 4. Execution Logic
+        if status != "REJECTED" and status != "PENDING":
+             exec_price = order.price
+             
+             if order.order_type == "MARKET":
+                  if current_ltp > 0:
+                     exec_price = current_ltp
+                     status = "EXECUTED"
+                  else:
+                     status = "REJECTED"
+                     msg = "Market Price Unavailable"
+                 
+             elif order.order_type == "LIMIT":
+                 if order.side == "BUY" and current_ltp > 0 and current_ltp <= order.price:
+                     exec_price = order.price 
+                     status = "EXECUTED"
+                 elif order.side == "SELL" and current_ltp > 0 and current_ltp >= order.price:
+                     exec_price = order.price
+                     status = "EXECUTED"
+                 else:
+                     status = "PENDING"
+                     msg = "Limit Price not reached"
+
+        # 5. Broker Call (If Executed)
         if status == "EXECUTED":
             try:
+                # Delegate to PaperBroker (It handles logging internally)
                 res = paper_broker.place_order(
                     symbol=order.symbol,
                     quantity=order.quantity,
@@ -808,16 +901,16 @@ def place_order_endpoint(order: OrderRequest):
                     product=order.product,
                     order_type=order.order_type
                 )
-                avg_price = res["average_price"]
-                msg = "Order Executed"
+                # We return the broker's result directly, avoiding double log
+                return {"status": "success", "data": res}
+                
             except Exception as e:
                 logger.error(f"Broker Error: {e}")
                 status = "REJECTED"
                 msg = str(e)
-        else:
-            avg_price = order.price
-
-        # 5. Persist Order Log (Crucial: Save even if Rejected)
+                
+        # 6. Persist Order Log ONLY if NOT Executed by Broker (Pending/Rejected)
+        # Because PaperBroker didn't run, we must log it here.
         order_record = {
             "order_id": order_id,
             "timestamp": timestamp,
@@ -839,13 +932,22 @@ def place_order_endpoint(order: OrderRequest):
              return {"status": "error", "message": msg, "data": order_record}
              
         return {
-            "status": "success" if status == "EXECUTED" else "pending", 
+            "status": "pending", 
             "data": order_record
         }
 
     except Exception as e:
         logger.error(f"Place Order Failed: {e}")
         return {"status": "error", "message": str(e)}
+
+@app.delete("/api/reset")
+def reset_system_state():
+    """
+    Clears all orders and positions.
+    """
+    state_manager.reset()
+    # Also reset local cache/variables if any
+    return {"status": "success", "message": "System State Reset. Orders and Positions cleared."}
 
 if __name__ == "__main__":
     import uvicorn

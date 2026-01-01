@@ -17,7 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
-import { Download, Search, TrendingUp, TrendingDown } from "lucide-react";
+import { Download, Search, TrendingUp, TrendingDown, Trash2 } from "lucide-react";
 import { useState } from "react";
 
 interface HistoricalTrade {
@@ -40,6 +40,25 @@ interface HistoricalTrade {
 export function TradeHistory() {
   const [filterType, setFilterType] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
+
+  const handleDeleteOrder = async (orderId: string) => {
+    if (!confirm("Are you sure you want to remove this order from the logs?")) return;
+    try {
+      // Note: Using port 8000 as configured in main.py
+      const res = await fetch(`http://localhost:8000/api/orders/${orderId}`, {
+        method: 'DELETE'
+      });
+      if (res.ok) {
+        alert("Order removed (mock UI won't update unless wired to API)");
+        // In a real app, calls fetchOrders() here.
+      } else {
+        alert("Failed to remove order");
+      }
+    } catch (error) {
+      console.error(error);
+      alert("Error removing order");
+    }
+  };
 
   const historicalTrades: HistoricalTrade[] = [
     {
@@ -276,6 +295,7 @@ export function TradeHistory() {
               <TableHead>Strategy</TableHead>
               <TableHead>Exit Reason</TableHead>
               <TableHead>Duration</TableHead>
+              <TableHead className="w-[50px]"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -299,9 +319,8 @@ export function TradeHistory() {
                 <TableCell>₹{trade.exitPrice.toFixed(2)}</TableCell>
                 <TableCell>
                   <div
-                    className={`flex items-center gap-1 ${
-                      trade.pnl >= 0 ? "text-green-600" : "text-red-600"
-                    }`}
+                    className={`flex items-center gap-1 ${trade.pnl >= 0 ? "text-green-600" : "text-red-600"
+                      }`}
                   >
                     {trade.pnl >= 0 ? (
                       <TrendingUp className="size-4" />
@@ -322,6 +341,11 @@ export function TradeHistory() {
                 </TableCell>
                 <TableCell className="text-sm">{trade.exitReason}</TableCell>
                 <TableCell className="text-sm">{trade.duration}</TableCell>
+                <TableCell>
+                  <Button variant="ghost" size="icon" onClick={() => handleDeleteOrder(trade.id)}>
+                    <Trash2 className="h-4 w-4 text-red-500" />
+                  </Button>
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>

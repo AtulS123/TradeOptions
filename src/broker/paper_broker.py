@@ -72,23 +72,61 @@ class PaperBroker(IVirtualBroker):
         logger.info(f"Simulated Fill: {quantity} {symbol} @ {round(executed_price, 2)} (Slippage: {round(slippage, 2)}, Costs: {costs})")
         
         # 3. ATOMIC PERSISTENCE (Sole Authority)
+        # 3. ATOMIC PERSISTENCE (Sole Authority)
         if side == "BUY":
-            # Opening a Position
-            # We assume BUY = OPEN for Long Options interactions
-            self.state_manager.add_position(symbol, {
-                "token": token,
-                "symbol": symbol,
-                "quantity": quantity,
-                "entry_price": round(executed_price, 2),
-                "stop_loss": stop_loss, # Persisted!
-                "target": target,       # Persisted!
-                "option_type": "CE" if "CE" in symbol else "PE", # Inference fallback
-                "strategy_name": strategy_tag,
-                "timestamp": timestamp,
-                "product": product,        # MIS/NRML
-                "order_type": order_type,  # MARKET/LIMIT/SL
-                "strike": 0 # TODO: Pass strike if needed, currently inferred or irrelevant for basic pnl
-            })
+            # Check for existing position to Average Up
+            existing_pos = self.state_manager.state.open_positions.get(symbol)
+            
+            if existing_pos:
+                old_qty = existing_pos.get("quantity", 0)
+                old_entry = existing_pos.get("entry_price", 0.0)
+                
+                new_qty = old_qty + quantity
+                # Weighted Average Price
+                avg_price = ((old_entry * old_qty) + (executed_price * quantity)) / new_qty
+                
+                # Update existing details
+                details = existing_pos.copy()
+                details["quantity"] = new_qty
+                details["entry_price"] = round(avg_price, 2)
+                details["timestamp"] = timestamp # Update timestamp to latest interaction? Or keep open time? Keeping latest.
+                
+                self.state_manager.add_position(symbol, details)
+                logger.info(f"Averaged Up {symbol}: New Qty {new_qty} @ {avg_price}")
+                
+            else:
+                # Opening a Position
+                # We assume BUY = OPEN for Long Options interactions
+                self.state_manager.add_position(symbol, {
+                    "token": token,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "entry_price": round(executed_price, 2),
+                    "stop_loss": stop_loss, 
+                    "target": target,      
+                    "option_type": "CE" if "CE" in symbol else "PE", 
+                    "strategy_name": strategy_tag,
+                    "timestamp": timestamp,
+                    "product": product,       
+                    "order_type": order_type,
+                    "strike": 0 
+                })
+        
+        # 4. Log Order to History
+        order_record = {
+            "order_id": order_id,
+            "timestamp": timestamp,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": round(executed_price, 2),
+            "status": "EXECUTED",
+            "strategy": strategy_tag,
+            "slippage": round(slippage, 2),
+            "costs": round(costs, 2),
+            "pnl": 0.0 # Filled order has no PnL yet. Exit orders will log Realized PnL via close_position logic or separate update.
+        }
+        self.state_manager.add_order(order_record)
         
         # Note: SELL side persistence is handled via 'close_position' method usually.
         # But if 'place_order' (SELL) is called directly, we might want to handle it?

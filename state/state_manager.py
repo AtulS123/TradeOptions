@@ -130,3 +130,22 @@ class StateManager:
             if t:
                 tokens.append(int(t))
         return tokens
+
+    def delete_order(self, order_id: str) -> bool:
+        """
+        Removes an order from the order log by its order_id.
+        Returns True if found and removed, False otherwise.
+        """
+        initial_count = len(self.state.orders)
+        self.state.orders = [o for o in self.state.orders if o.get('order_id') != order_id]
+        
+        if len(self.state.orders) < initial_count:
+            self.save()
+            return True
+        return False
+
+    def reset(self):
+        """Resets the state completely."""
+        self.store.clear()
+        self.state = TradeState()
+        logger.info("State has been reset.")
