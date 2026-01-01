@@ -38,3 +38,10 @@ logs/
 access_token.txt
 trading_state.json
 src/data/*.csv
+
+# Data
+data/
+
+# Temporary files
+*.tmp
+~$*

@@ -56,12 +56,14 @@ def get_best_strike(chain_data: List[Dict], option_type: str, target_delta: floa
             min_diff = diff
             best_match = {
                 "strike": strike,
+                "token": token,
                 "instrument_token": token,
                 "ltp": ltp,
                 "delta": delta,
                 "type": option_type,
                 "oi": oi,
-                "volume": volume
+                "volume": volume,
+                "symbol": row.get('callSymbol') if option_type == "CE" else row.get('putSymbol')
             }
             
     if best_match and min_diff <= MAX_DELTA_DIFF:

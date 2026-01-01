@@ -16,6 +16,7 @@ class TradeState:
     daily_pnl: float = 0.0
     kill_switch_active: bool = False
     open_positions: Dict[str, dict] = field(default_factory=dict)
+    orders: List[dict] = field(default_factory=list) # Log of all orders (Open/Executed/Cancelled)
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
 
 class BaseStateStore(ABC):
@@ -112,6 +113,11 @@ class StateManager:
         if symbol in self.state.open_positions:
             del self.state.open_positions[symbol]
             self.save()
+            
+    def add_order(self, order: dict):
+        """Appends an order to the order log."""
+        self.state.orders.append(order)
+        self.save()
 
     def get_active_tokens(self) -> List[int]:
         """Returns list of active instrument tokens (as ints)."""

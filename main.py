@@ -45,7 +45,7 @@ strategy_manager = StrategyManager()
 vwap_strategy = VWAPStrategy() # The Plugin
 
 # Risk Manager (Gatekeeper)
-risk_manager = RiskManager(total_capital=100000.0)
+risk_manager = RiskManager(total_capital=200000.0)
 
 # Execution Layer
 paper_broker = PaperBroker(state_manager, slippage_pct=0.0005) # 0.05%
@@ -61,6 +61,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/ping")
+def ping():
+    return "pong"
 
 def get_nearest_expiry(df: pd.DataFrame) -> date:
     """Find the nearest upcoming expiry date."""
@@ -156,8 +160,8 @@ async def market_data_loop():
             nifty_tick = {
                 "instrument_token": spot_quote["NSE:NIFTY 50"]["instrument_token"],
                 "last_price": nifty_ltp,
-                "volume": spot_quote["NSE:NIFTY 50"]["volume"], # Cumulative
-                "cumulative_volume": spot_quote["NSE:NIFTY 50"]["volume"],
+                "volume": spot_quote["NSE:NIFTY 50"].get("volume", 0), # Cumulative
+                "cumulative_volume": spot_quote["NSE:NIFTY 50"].get("volume", 0),
                 "timestamp": datetime.now()
             }
             
@@ -363,19 +367,31 @@ async def market_data_loop():
                 pe_ltp = pe_data['last_price']
                 ce_oi = ce_data['oi']
                 pe_oi = pe_data['oi']
-                ce_vol = ce_data['volume']
-                pe_vol = pe_data['volume']
+                ce_vol = ce_data.get('volume', 0)
+                pe_vol = pe_data.get('volume', 0)
                 
                 total_ce_oi += ce_oi
                 total_pe_oi += pe_oi
 
+                # Fetch Lot Size
+                # We can grab it from 'relevant_strikes' or 'instrument_df'
+                # Assuming all Nifty contracts have same lot size for this expiry
+                lot_size = int(relevant_strikes.iloc[0]['lot_size'])
+
                 # Greeks
+                # Calculate Time to Expiry in Years
+                expiry_dt = datetime.combine(expiry_date, datetime.min.time())
+                now = datetime.now()
+                diff = expiry_dt - now
+                days_to_expiry = max(diff.days + (diff.seconds / 86400.0), 1e-5) # Avoid div by zero
+                t_years = days_to_expiry / 365.0
+                r = 0.10 # 10% Risk Free Rate assumption
                 ce_iv, ce_delta = calculate_greeks('CE', nifty_ltp, strike, t_years, r, ce_ltp)
                 pe_iv, pe_delta = calculate_greeks('PE', nifty_ltp, strike, t_years, r, pe_ltp)
                 
                 new_chain_data.append({
                     "strike": float(strike),
-                    "callOI": ce_oi,
+                    "callOI": int(ce_oi / lot_size), # Convert to Contracts/Lots
                     "callVolume": ce_vol,
                     "callLTP": ce_ltp,
                     "callIV": ce_iv,
@@ -383,7 +399,7 @@ async def market_data_loop():
                     "putLTP": pe_ltp,
                     "putIV": pe_iv,
                     "putVolume": pe_vol,
-                    "putOI": pe_oi,
+                    "putOI": int(pe_oi / lot_size), # Convert to Contracts/Lots
                     "putDelta": pe_delta,
                     "ce_token": ce_token,
                     "pe_token": pe_token
@@ -391,7 +407,9 @@ async def market_data_loop():
             
             option_chain_data = sorted(new_chain_data, key=lambda x: x['strike'])
             
-            # Calculate PCR
+            # Calculate PCR (Volume or OI based?) Usually OI.
+            # Using raw OI sum for PCR calculation to preserve precision or use converted?
+            # Ratio is same.
             if total_ce_oi > 0:
                 market_status["pcr"] = round(total_pe_oi / total_ce_oi, 2)
             else:
@@ -422,8 +440,22 @@ async def startup_event():
     
     logger.info("Connecting to Kite Connect...")
     try:
+        final_access_token = ACCESS_TOKEN
+        
+        # Check for file-based token override
+        token_file = "access_token.txt"
+        if os.path.exists(token_file):
+            try:
+                with open(token_file, "r") as f:
+                    file_token = f.read().strip()
+                if file_token:
+                    final_access_token = file_token
+                    logger.info(f"Loaded Access Token from {token_file}")
+            except Exception as e:
+                logger.warning(f"Failed to read {token_file}: {e}")
+
         kite = KiteConnect(api_key=API_KEY)
-        kite.set_access_token(ACCESS_TOKEN)
+        kite.set_access_token(final_access_token)
         
         # Test connection
         profile = kite.profile()
@@ -653,6 +685,68 @@ def close_trade_manual(token: int):
         
     except Exception as e:
         logger.error(f"Manual Close Error: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/manual-trade")
+def place_manual_trade(type: str = "CE", quantity: Optional[int] = None):
+    """
+    Manually triggers a paper trade for the best strike.
+    """
+    global option_chain_data, market_status
+    
+    # 1. Get Market Context
+    if market_status["nifty_price"] == 0:
+        return {"status": "error", "message": "Market data not yet available"}
+        
+    s = market_status["nifty_price"]
+    
+    # 2. Select Strike (ATM)
+    # Reuse simple logic or get_best_strike
+    # Let's use get_best_strike with Delta ~0.5 (ATM)
+    target_strike = get_best_strike(option_chain_data, type, 0.55) 
+    
+    if not target_strike:
+         return {"status": "error", "message": "No suitable strike found"}
+         
+    entry_ltp = target_strike["ltp"]
+    stop_loss = entry_ltp * 0.90
+    
+    # 3. Sizing
+    if quantity:
+        qty = quantity
+    else:
+        qty = risk_manager.get_target_size(entry_ltp, stop_loss)
+        if qty < 25: qty = 25 # Min 1 lot
+        
+    # 4. Execute
+    try:
+        exec_result = paper_broker.place_order(
+            symbol=target_strike["symbol"],
+            quantity=qty,
+            side="BUY",
+            price=entry_ltp
+        )
+        
+        # 5. Persist
+        state_manager.add_position(target_strike["symbol"], {
+            "token": target_strike["token"],
+            "symbol": target_strike["symbol"],
+            "quantity": qty,
+            "entry_price": exec_result["average_price"],
+            "stop_loss": stop_loss,
+            "target": entry_ltp * 1.2,
+            "option_type": type,
+            "strategy_name": "MANUAL",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        return {
+            "status": "success", 
+            "trade": exec_result,
+            "strike": target_strike["symbol"]
+        }
+    except Exception as e:
+        logger.error(f"Manual Trade Failed: {e}")
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":

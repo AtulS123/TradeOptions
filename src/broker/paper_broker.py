@@ -30,17 +30,34 @@ class PaperBroker(IVirtualBroker):
                    strategy_tag: str = "MANUAL", token: int = 0) -> Dict[str, Any]:
         """
         Executes a paper trade with simulated realism and ATOMIC persistence.
+        Supports MARKET, LIMIT, SL, SL-M orders.
         """
-        # 1. Simulate Slippage
+        # 1. Simulate Slippage & Execution Price
         slippage = 0.0
         executed_price = price
         
-        if side == "BUY":
-            slippage = price * self.slippage_pct
-            executed_price = price + slippage
-        elif side == "SELL":
-            slippage = price * self.slippage_pct
-            executed_price = price - slippage
+        # LOGIC:
+        # MARKET: Fill at Current LTP (passed as 'price') +/- Slippage
+        # LIMIT: Fill at Limit Price (passed as 'price')
+        # SL: Fill at Limit Price (passed as 'price')
+        # SL-M: Fill at Trigger Price (passed as 'trigger_price')
+        
+        if order_type == "MARKET":
+            # 'price' argument here is Current LTP
+            if side == "BUY":
+                slippage = price * self.slippage_pct
+                executed_price = price + slippage
+            elif side == "SELL":
+                slippage = price * self.slippage_pct
+                executed_price = price - slippage
+        
+        elif order_type == "SL-M":
+             executed_price = trigger_price
+             # Add slippage to trigger? Ideally yes, but keeping simple.
+             
+        else:
+            # LIMIT or SL -> Fill at Limit Price
+            executed_price = price
 
         # 2. Calculate Costs
         costs = self.cost_model.calculate_transaction_cost(
@@ -68,6 +85,8 @@ class PaperBroker(IVirtualBroker):
                 "option_type": "CE" if "CE" in symbol else "PE", # Inference fallback
                 "strategy_name": strategy_tag,
                 "timestamp": timestamp,
+                "product": product,        # MIS/NRML
+                "order_type": order_type,  # MARKET/LIMIT/SL
                 "strike": 0 # TODO: Pass strike if needed, currently inferred or irrelevant for basic pnl
             })
         

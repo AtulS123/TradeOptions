@@ -11,6 +11,7 @@ import {
 } from "./ui/table";
 import { AlertCircle, RefreshCw } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
+import { OrderEntryModal } from "./OrderEntryModal";
 
 interface OptionRow {
   strike: number;
@@ -42,12 +43,15 @@ export function MarketData() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
 
+  // Modal State
+  const [selectedOption, setSelectedOption] = useState<{ symbol: string; ltp: number; type: "CE" | "PE" } | null>(null);
+
   const fetchData = async () => {
     try {
       // Parallel fetch
       const [statusRes, chainRes] = await Promise.all([
-        fetch("http://localhost:8000/market-status"),
-        fetch("http://localhost:8000/option-chain"),
+        fetch("http://localhost:8001/market-status"),
+        fetch("http://localhost:8001/option-chain"),
       ]);
 
       if (!statusRes.ok || !chainRes.ok) {
@@ -75,6 +79,11 @@ export function MarketData() {
 
     return () => clearInterval(interval);
   }, []);
+
+  const handleOptionClick = (strike: number, type: "CE" | "PE", ltp: number) => {
+    const symbol = `NIFTY ${strike} ${type}`;
+    setSelectedOption({ symbol, ltp, type });
+  };
 
   return (
     <div className="space-y-6">
@@ -177,13 +186,23 @@ export function MarketData() {
                       <TableCell className="text-right font-mono text-xs text-muted-foreground">{row.callVolume.toLocaleString()}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{row.callIV}%</TableCell>
                       <TableCell className="text-right font-mono text-xs">{row.callDelta}</TableCell>
-                      <TableCell className="text-right font-mono font-bold text-green-600">{row.callLTP.toFixed(2)}</TableCell>
+                      <TableCell
+                        className="text-right font-mono font-bold text-green-600 cursor-pointer hover:bg-green-100"
+                        onClick={() => handleOptionClick(row.strike, "CE", row.callLTP)}
+                      >
+                        {row.callLTP.toFixed(2)}
+                      </TableCell>
 
                       {/* STRIKE */}
                       <TableCell className="text-center font-bold bg-muted/20">{row.strike}</TableCell>
 
                       {/* PUTS */}
-                      <TableCell className="text-left font-mono font-bold text-red-600">{row.putLTP.toFixed(2)}</TableCell>
+                      <TableCell
+                        className="text-left font-mono font-bold text-red-600 cursor-pointer hover:bg-red-100"
+                        onClick={() => handleOptionClick(row.strike, "PE", row.putLTP)}
+                      >
+                        {row.putLTP.toFixed(2)}
+                      </TableCell>
                       <TableCell className="text-left font-mono text-xs">{row.putDelta}</TableCell>
                       <TableCell className="text-left font-mono text-xs">{row.putIV}%</TableCell>
                       <TableCell className="text-left font-mono text-xs text-muted-foreground">{row.putVolume.toLocaleString()}</TableCell>
@@ -196,6 +215,17 @@ export function MarketData() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Order Entry Modal */}
+      {selectedOption && (
+        <OrderEntryModal
+          isOpen={!!selectedOption}
+          onClose={() => setSelectedOption(null)}
+          symbol={selectedOption.symbol}
+          ltp={selectedOption.ltp}
+          type={selectedOption.type}
+        />
+      )}
     </div>
   );
 }

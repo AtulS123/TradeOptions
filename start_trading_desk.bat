@@ -12,7 +12,7 @@ set "FRONTEND_DIR=%SCRIPT_DIR%01 Figma"
 echo [1/3] Starting Backend API Server...
 :: Using pushd to ensure we are in the script directory
 pushd "%SCRIPT_DIR%"
-start "AlgoBackend" cmd /k "python -m uvicorn main:app --reload --port 8000"
+start "AlgoBackend" cmd /k "python server_v2.py"
 popd
 
 echo [2/3] Starting Frontend Dashboard...

@@ -19,7 +19,7 @@ class VWAPStrategy(BaseStrategy):
         self.last_tick_time = None
         
         # Parameters
-        self.volume_multiplier = 1.5
+        self.volume_multiplier = 0.01 # Relaxed for testing (was 1.5)
         
     def seed_candles(self, historical_df: pd.DataFrame):
         """
@@ -29,30 +29,46 @@ class VWAPStrategy(BaseStrategy):
             historical_df: DF with columns ['timestamp', 'open', 'high', 'low', 'close', 'volume']
         """
         if historical_df.empty:
-            return
+            logger.warning("VWAP Seed: Empty dataframe.")
+            return False
 
         logger.info(f"Seeding VWAP with {len(historical_df)} candles...")
         
+        # Ensure timestamp column
+        if 'date' in historical_df.columns and 'timestamp' not in historical_df.columns:
+            historical_df.rename(columns={'date': 'timestamp'}, inplace=True)
+
         # Ensure timestamp is datetime
-        historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
+        if 'timestamp' in historical_df.columns:
+            historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
+        else:
+             logger.error("VWAP Seed Failed: No 'timestamp' or 'date' column in data.")
+             return False
         
         # 1. Reset Candles
         self.candles = historical_df.copy().sort_values('timestamp').reset_index(drop=True)
         
         # 2. Re-calculate indicators logic
-        # We need 'start_cum_vol' for the current candle logic, but for historical
-        # we can just assume the provided volume IS the 1-min volume.
-        
-        # 3. Recalculate VWAP from the start of this DF
-        # Assuming the DF starts from 9:15 AM today.
-        
         price = self.candles['close']
         vol = self.candles['volume']
         
+        # Validation: Check for logic gaps (e.g. all zero volume)
+        if vol.sum() == 0:
+            logger.error("VWAP Seed Critical: Total Volume is 0. Are you using SPOT Index? Please use FUTURES.")
+            return False
+
         # VWAP Calculation
         self.candles['cum_pairs'] = (price * vol).cumsum()
         self.candles['cum_vol'] = vol.cumsum()
-        self.candles['vwap'] = self.candles['cum_pairs'] / self.candles['cum_vol']
+        
+        # Avoid division by zero warnings/errors in pandas
+        self.candles['vwap'] = self.candles['cum_pairs'] / self.candles['cum_vol'].replace(0, float('nan'))
+        
+        # Check for NaN in last value
+        last_vwap = self.candles.iloc[-1]['vwap']
+        if pd.isna(last_vwap):
+             logger.critical(f"VWAP Seed Critical: Calculated VWAP is NaN. (Last CumVol: {self.candles.iloc[-1]['cum_vol']})")
+             return False
         
         # EMA
         self.candles['ema_20'] = self.candles['close'].ewm(span=20, adjust=False).mean()
@@ -60,7 +76,8 @@ class VWAPStrategy(BaseStrategy):
         # Vol SMA
         self.candles['vol_sma_20'] = self.candles['volume'].rolling(window=20).mean()
         
-        logger.info(f"VWAP Seeded. Last VWAP: {self.candles.iloc[-1]['vwap']:.2f}")
+        logger.info(f"VWAP Seeded. Last VWAP: {last_vwap:.2f}")
+        return True
 
     @property
     def name(self) -> str:
@@ -179,6 +196,11 @@ class VWAPStrategy(BaseStrategy):
             action = "BUY"
         elif price < vwap and price < ema and vol > (avg_vol * self.volume_multiplier):
             action = "SELL" # Or PE BUY
+        
+        # Debug Log
+        if not action:
+            logger.info(f"VWAP No Signal: P={price:.2f} V={vwap:.2f} E={ema:.2f} Vol={vol} AvgVol={avg_vol}")
+            
             
         if action:
             logger.info(f"VWAP Signal Detected: {action} @ {price}")
