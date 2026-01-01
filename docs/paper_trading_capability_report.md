@@ -42,7 +42,16 @@ The system is currently hard-wired for **Paper Trading Mode** at the application
   - `daily_pnl`: Aggregated Realized P&L for the day.
   - `open_positions`: Detailed map of active virtual positions (Symbol, Qty, Entry Price, Stops).
 - **Reset Logic:** Automatically resets `daily_pnl` and `open_positions` if the system detects the date has changed since the last update.
+- **Persistence:** All orders (Entry, Exit, Rejected) are atomically appended to `orders` list in `state_manager`, providing a durable audit trail even across server restarts.
 - **Limits:** `PaperBroker.get_limits()` currently returns a hardcoded mock cash balance of `100,000.0`. `RiskManager` (initialized in `server_v2.py`) manages a separate virtual capital pool (`total_capital=200000.0`).
+
+## 5. Manual Intervention
+
+**Current Status:** [Full Support]
+
+- **Manual Position Taker:** Users can execute Market/Limit orders directly from the UI (Option Chain).
+- **Validation:** Manual orders are subject to the same Margin Checks and Risk Limits as algorithmic trades.
+- **Visibility:** Manual trades appear alongside algorithmic trades in the "Active Positions" and "Orders" tabs.
 
 ## 4. Data Dependency
 
