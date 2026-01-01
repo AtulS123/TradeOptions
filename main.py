@@ -749,6 +749,43 @@ def place_manual_trade(type: str = "CE", quantity: Optional[int] = None):
         logger.error(f"Manual Trade Failed: {e}")
         return {"status": "error", "message": str(e)}
 
+
+# --- Backtest API ---
+from pydantic import BaseModel
+from src.backtest_runner import BacktestRunner
+
+class BacktestRequest(BaseModel):
+    strategy: str = "VWAP_MOMENTUM"
+    start_date: str = "2024-01-01"
+    end_date: str = "2024-01-31"
+    capital: float = 100000.0
+
+@app.post("/api/backtest/run")
+def run_backtest_endpoint(request: BacktestRequest):
+    """
+    Runs a backtest simulation.
+    """
+    logger.info(f"Received Backtest Request: {request}")
+    
+    # 1. Select Strategy
+    # Ideally use a factory. For now, hardcode VWAP.
+    # Note: Strategy instances should be fresh for backtest to avoid pollution from live state.
+    if request.strategy == "VWAP_MOMENTUM":
+        algo = VWAPStrategy()
+    else:
+        # Fallback
+        algo = VWAPStrategy()
+        
+    # 2. Run
+    runner = BacktestRunner(initial_capital=request.capital)
+    
+    # Verify Data Path: The runner defaults to "data/backtest/synthetic_options.csv"
+    # Ensure this path is correct relative to execution dir (project root).
+    
+    result = runner.run(algo, request.start_date, request.end_date)
+    
+    return result
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

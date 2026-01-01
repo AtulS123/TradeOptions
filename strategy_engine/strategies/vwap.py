@@ -158,7 +158,7 @@ class VWAPStrategy(BaseStrategy):
         
         df['cum_pairs'] = (price * vol).cumsum()
         df['cum_vol'] = vol.cumsum()
-        df['vwap'] = df['cum_pairs'] / df['cum_vol']
+        df['vwap'] = df['cum_pairs'] / df['cum_vol'].replace(0, float('nan'))
         
         # EMA 20
         df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()

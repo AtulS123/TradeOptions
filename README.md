@@ -31,6 +31,13 @@ A modular, robust, and stateful algorithmic trading bot for NIFTY Options.
 - **Manual Control**: "Close Position" button for manual intervention.
 - [Learn More](docs/frontend_guide.md)
 
+### 5. Backtest Engine (`src/backtest_runner.py`)
+
+- **Simulation**: Validates strategies against historical data.
+- **In-Memory**: Fast execution without affecting live state.
+- **Visuals**: Plots Equity Curve and Win Rate in the UI.
+- [Learn More](docs/backtest_engine.md)
+
 ## 🛠️ Setup & Running
 
 1. **Install Dependencies**:
