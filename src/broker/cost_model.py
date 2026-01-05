@@ -8,18 +8,18 @@ class CostModel:
     Used for estimating slippage and fees in Backtesting and Live execution.
     """
     
-    # Fee Structure Constants
+    # Fee Structure Constants (Zerodha / NSE - Updated Oct 2024)
     BROKERAGE_PER_ORDER = 20.0
-    STT_PERCENT_SELL = 0.001       # 0.1% on Sell Only
-    EXCHANGE_TXN_PERCENT = 0.0003503 # 0.03503%
+    STT_PERCENT_SELL = 0.001       # 0.1% on Sell Only (Premium)
+    EXCHANGE_TXN_PERCENT = 0.00035 # 0.035% (NSE Options)
     STAMP_DUTY_PERCENT_BUY = 0.00003 # 0.003% on Buy Only
-    SEBI_TURNOVER_FEE = 0.000001   # ₹10 per crore
-    GST_PERCENT = 0.18             # 18% on Services
+    SEBI_TURNOVER_FEE = 0.0000015  # ₹15 per crore
+    GST_PERCENT = 0.18             # 18% on (Brokerage + Txn + SEBI)
 
     @staticmethod
-    def calculate_transaction_cost(price: float, quantity: int, side: str) -> float:
+    def get_breakdown(price: float, quantity: int, side: str) -> dict:
         """
-        Calculates cost for a SINGLE leg (Buy OR Sell).
+        Calculates granular cost breakdown for a SINGLE leg.
         """
         turnover = price * quantity
         
@@ -46,7 +46,24 @@ class CostModel:
         gst = (brokerage + exchange_charges + sebi_fees) * CostModel.GST_PERCENT
         
         total = brokerage + stt + exchange_charges + stamp_duty + sebi_fees + gst
-        return round(total, 2)
+        
+        return {
+            "brokerage": brokerage,
+            "stt": stt,
+            "exchange_charges": exchange_charges,
+            "stamp_duty": stamp_duty,
+            "sebi_fees": sebi_fees,
+            "gst": gst,
+            "total": round(total, 2)
+        }
+
+    @staticmethod
+    def calculate_transaction_cost(price: float, quantity: int, side: str) -> float:
+        """
+        Calculates total cost for a SINGLE leg (Buy OR Sell).
+        """
+        breakdown = CostModel.get_breakdown(price, quantity, side)
+        return breakdown["total"]
 
     @staticmethod
     def calculate_estimated_cost(entry_price: float, exit_price: float, quantity: int) -> float:

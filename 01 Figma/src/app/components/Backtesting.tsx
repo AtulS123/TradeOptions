@@ -21,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { Slider } from "./ui/slider";
 import { Badge } from "./ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
@@ -57,19 +58,38 @@ import {
   ArrowUpRight,
   ArrowDownRight
 } from "lucide-react";
+import { toast } from "sonner";
+
+// Strategy Descriptions for Tooltip
+const STRATEGY_DESCRIPTIONS: Record<string, string> = {
+  "vwap": "VWAP Momentum: Enters trades when price crosses the Volume Weighted Average Price with confirmation. Uses Futures data for Volume.",
+  "rsi_reversal": "RSI Reversal: Mean reversion. Buys PUT when RSI > 80 (Overbought). Buys CALL when RSI < 20 (Oversold).",
+  "short_straddle": "Short Straddle: Sells both a Call and a Put at the ATM strike. Profits from low volatility and time decay.",
+  "iron_condor": "Iron Condor: Sells an OTM Put and OTM Call, and buys further OTM wings for protection. Delta neutral strategy.",
+  "bull_call": "Bull Call Spread: Buys an ATM Call and sells an OTM Call. Limited profit, limited risk bullish strategy.",
+  "long_straddle": "Long Straddle: Buys both a Call and a Put at the ATM strike. Profits from high volatility.",
+  "covered_call": "Covered Call: Holds the underlying asset and sells OTM Calls against it for income."
+};
 import {
   AreaChart,
   Area,
   XAxis,
   YAxis,
   CartesianGrid,
-  Tooltip,
+  Tooltip as ChartTooltip, // Renamed to avoid conflict with UI Tooltip
   ResponsiveContainer,
 } from "recharts";
 import { cn } from "./ui/utils";
 
 // --- FORM SCHEMA ---
+// --- FORM SCHEMA ---
 const formSchema = z.object({
+  // New: Data Source
+  dataSource: z.enum(["KITE_API", "MANUAL"]),
+  candleInterval: z.string().optional(),
+  spotFile: z.string().optional(),
+  vixFile: z.string().optional(),
+
   // Section A: Strategy Logic
   strategyType: z.string(),
   underlying: z.string(),
@@ -77,8 +97,8 @@ const formSchema = z.object({
   entryDays: z.array(z.string()).default(["All Days"]),
 
   // Section B: Capital & Backtest
-  startDate: z.string(),
-  endDate: z.string(),
+  startDate: z.string().min(1, "Start Date is required"),
+  endDate: z.string().min(1, "End Date is required"),
   initialCapital: z.coerce.number().min(10000),
   positionSizing: z.string(),
   riskPerTrade: z.number().min(0.5).max(10),
@@ -104,17 +124,21 @@ const formSchema = z.object({
 type FormValues = z.infer<typeof formSchema>;
 
 const DEFAULT_VALUES: FormValues = {
+  dataSource: "KITE_API",
+  candleInterval: "1m",
+  spotFile: "",
+  vixFile: "",
   strategyType: "vwap",
   underlying: "NIFTY 50",
   strikeSelection: "atm",
   entryDays: ["All Days"],
-  startDate: "2024-01-01",
-  endDate: "2024-12-31", // Full Year 2024
+  startDate: "2025-12-15",
+  endDate: "2026-01-01",
   initialCapital: 100000, // Explicitly set to 100k
   positionSizing: "fixed",
   riskPerTrade: 1.0,
-  entryTime: "09:20",
-  exitTime: "15:15",
+  entryTime: "09:15",
+  exitTime: "15:30",
   targetProfit: 50,
   stopLoss: 25,
   spotCondition: "any",
@@ -151,7 +175,9 @@ const MOCK_RESULTS = {
     avg_theta: -98.61,
     avg_vega: 35.64,
     avg_iv: 20.37,
-  }
+  },
+  equity_curve: [],
+  trades: []
 };
 
 const MOCK_EQUITY_CURVE = Array.from({ length: 50 }, (_, i) => ({
@@ -160,6 +186,18 @@ const MOCK_EQUITY_CURVE = Array.from({ length: 50 }, (_, i) => ({
   drawdown: Math.min(0, (Math.random() - 0.8) * 5) // Fake drawdown data
 }));
 
+// --- METADATA INTERFACES ---
+interface KiteLimit {
+  max_days: number;
+  description: string;
+}
+
+interface LocalSource {
+  id: string;
+  name: string;
+  granularity: string;
+  path: string;
+}
 
 export function Backtesting() {
   const [isLoading, setIsLoading] = useState(false);
@@ -167,10 +205,60 @@ export function Backtesting() {
   const [activeTab, setActiveTab] = useState("simulate");
   const [chartTab, setChartTab] = useState("equity");
 
+  // Progress State
+  const [progress, setProgress] = useState(0);
+  const [progressStatus, setProgressStatus] = useState("Initializing...");
+
+  // Metadata State
+  const [kiteLimits, setKiteLimits] = useState<Record<string, KiteLimit>>({});
+  const [localSources, setLocalSources] = useState<{ spot: LocalSource[]; vix: LocalSource[] }>({ spot: [], vix: [] });
+
   const form = useForm<FormValues>({
-    resolver: zodResolver(formSchema),
+    resolver: zodResolver(formSchema) as any,
     defaultValues: DEFAULT_VALUES,
   });
+
+  // Fetch Metadata
+  useEffect(() => {
+    const fetchMetadata = async () => {
+      try {
+        const [kiteRes, localRes] = await Promise.all([
+          fetch('/api/metadata/kite-limits'),
+          fetch('/api/metadata/local-sources')
+        ]);
+
+        if (kiteRes.ok) setKiteLimits(await kiteRes.json());
+        if (localRes.ok) setLocalSources(await localRes.json());
+      } catch (e) {
+        console.error("Failed to fetch metadata", e);
+      }
+    };
+    fetchMetadata();
+  }, []);
+
+  // Auto-fill dates when candleInterval changes (for Kite API source)
+  useEffect(() => {
+    const dataSource = form.watch("dataSource");
+    const candleInterval = form.watch("candleInterval");
+
+    if (dataSource === "KITE_API" && candleInterval) {
+      const fetchDefaultDates = async () => {
+        try {
+          const response = await fetch(`http://127.0.0.1:8001/api/metadata/default-dates/${candleInterval}`);
+          if (response.ok) {
+            const data = await response.json();
+            // Auto-fill dates (user can still edit them)
+            form.setValue("startDate", data.start_date);
+            form.setValue("endDate", data.end_date);
+            console.log(`Auto-filled dates for ${candleInterval}: ${data.start_date} to ${data.end_date}`);
+          }
+        } catch (e) {
+          console.error("Failed to fetch default dates", e);
+        }
+      };
+      fetchDefaultDates();
+    }
+  }, [form.watch("dataSource"), form.watch("candleInterval")]);
 
   // Force-set values individually to ensure UI updates
   useEffect(() => {
@@ -184,8 +272,8 @@ export function Backtesting() {
       initialCapital: 100000,
       positionSizing: "fixed",
       riskPerTrade: 1.0,
-      entryTime: "09:20",
-      exitTime: "15:15",
+      entryTime: "09:15",
+      exitTime: "15:30",
       targetProfit: 50,
       stopLoss: 25,
       spotCondition: "any",
@@ -215,97 +303,146 @@ export function Backtesting() {
   }, []); // Run once on mount
 
   const onSubmit = async (data: FormValues) => {
-    console.log("Form Submitted:", data);
     setIsLoading(true);
-    setResult(null);
+    setResult(null); // Clear previous
+    setProgress(0);
+    setProgressStatus("Initializing...");
 
-    // Construct Payload for Backend (Pydantic Model)
-    const payload = {
-      strategy_config: {
-        strategy_type: data.strategyType,
-        underlying: data.underlying,
-        strike_selection: data.strikeSelection,
-        entry_days: data.entryDays,
-        entry_time: data.entryTime,
-        exit_time: data.exitTime,
-        target_profit_pct: Number(data.targetProfit) || 0,
-        stopLoss_pct: Number(data.stopLoss) || 0, // Typo in frontend state vs backend? Let's assume stopLoss map to stop_loss_pct
-        stop_loss_pct: Number(data.stopLoss) || 0,
-        spot_condition: data.spotCondition
-      },
-      risk_config: {
-        capital: Number(data.initialCapital),
-        position_sizing: data.positionSizing,
-        risk_per_trade_pct: Number(data.riskPerTrade),
-        max_slippage_pct: Number(data.slippage),
-        commission_per_lot: Number(data.commission)
-      },
-      start_date: data.startDate,
-      end_date: data.endDate,
-      timeframe: "1m",
-      data_source: "CSV" // Enforce CSV for now as per smoke test plan
-    };
+    // --- VALIDATION LOGIC ---
+    const start = new Date(data.startDate);
+    const end = new Date(data.endDate);
+    const now = new Date();
 
+    if (data.dataSource === "KITE_API") {
+      const limit = kiteLimits[data.candleInterval || "1m"];
+      if (limit) {
+        const diffTime = Math.abs(now.getTime() - start.getTime());
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+        if (diffDays > limit.max_days) {
+          toast.error(`Date Range Error: ${data.candleInterval || "1m"} data is only available for the last ${limit.max_days} days. (Your start date is ${diffDays} days ago)`);
+          setIsLoading(false);
+          return;
+        }
+      }
+    } else if (data.dataSource === "MANUAL") {
+      if (!data.spotFile) {
+        toast.error("Please select a Spot Data file.");
+        setIsLoading(false);
+        return;
+      }
+    }
+
+
+    // --- SSE STREAMING LOGIC ---
     try {
-      const response = await fetch('/api/backtest/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+      const payload = {
+        strategy_config: {
+          strategy_type: data.strategyType,
+          underlying: data.underlying,
+          strike_selection: data.strikeSelection,
+          entry_days: data.entryDays.includes("All Days")
+            ? ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+            : data.entryDays,
+          entry_time: data.entryTime,
+          exit_time: data.exitTime,
+          target_profit_pct: data.targetProfit,
+          stop_loss_pct: data.stopLoss,
+          spot_condition: data.spotCondition || "none"
+        },
+        risk_config: {
+          capital: data.initialCapital,
+          position_sizing: data.positionSizing,
+          risk_per_trade_pct: data.riskPerTrade,
+          max_slippage_pct: data.slippage,
+          commission_per_lot: data.commission
+        },
+        start_date: data.startDate,
+        end_date: data.endDate,
+        timeframe: data.candleInterval || "1m",
+        data_source: data.dataSource,
+        spot_file: data.spotFile,
+        vix_file: data.vixFile
+      };
+
+      const response = await fetch("http://127.0.0.1:8001/api/backtest/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
 
-      const json = await response.json();
+      if (!response.ok) throw new Error(`Server Error: ${response.status}`);
+      if (!response.body) throw new Error("No response body");
 
-      if (json.status === "success" || json.data) {
-        // NORMALIZE RESULT (Handle CamelCase / Legacy Backend Responses)
-        const raw = json.data || json;
-        const normalized: any = {
-          summary: raw.summary || {},
-          trade_stats: raw.trade_stats || {},
-          greeks: raw.greeks || { avg_delta: 0, avg_theta: 0, avg_vega: 0, avg_iv: 0 },
-          equity_curve: raw.equity_curve || raw.equityCurve || [],
-          trades: raw.trades || []
-        };
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      let buffer = ""; // Buffer for incomplete JSON lines
 
-        // 1. Fill Summary if missing
-        if (!raw.summary) {
-          // Attempt to derive from flat keys (netProfit, winRate)
-          const initialCap = values.initialCapital || 100000;
-          const netProfit = raw.netProfit || 0;
-          const finalCap = initialCap + netProfit;
+      while (!done) {
+        const { value, done: DONE } = await reader.read();
+        done = DONE;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          buffer += chunk;
 
-          normalized.summary = {
-            initial_capital: initialCap,
-            final_capital: finalCap,
-            total_return_pct: (netProfit / initialCap) * 100,
-            win_rate: raw.winRate || 0,
-            total_trades: raw.trades ? raw.trades.length : 0,
-            profit_factor: 0, // Hard to calc without trade list
-            sharpe_ratio: 0,
-            calmar_ratio: 0,
-            max_drawdown_pct: 0
-          };
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || ""; // Keep last incomplete line
+
+          for (const line of lines) {
+            if (line.trim() === "") continue;
+
+            try {
+              const msg = JSON.parse(line);
+              console.log("SSE Message:", msg.type);
+
+              if (msg.type === "progress") {
+                setProgress(msg.value);
+                setProgressStatus(msg.message);
+              } else if (msg.type === "result") {
+                console.log("Result received, setting state");
+                setResult(msg.data);
+                toast.success("Backtest Completed Successfully!");
+              } else if (msg.type === "error") {
+                toast.error(`Error: ${msg.message}`);
+              }
+            } catch (jsonErr) {
+              console.error("JSON Parse Error:", jsonErr, line.substring(0, 100));
+            }
+          }
         }
-
-        // 2. Fill Trade Stats if missing
-        if (!raw.trade_stats) {
-          // Basic placeholders
-          normalized.trade_stats = {
-            avg_win: 0, avg_loss: 0, largest_win: 0, largest_loss: 0, avg_days_in_trade: 0
-          };
-        }
-
-        setResult(normalized);
-      } else {
-        console.error("Backtest Failed:", json);
-        alert(`Backtest Failed: ${json.message || JSON.stringify(json)}`);
       }
-    } catch (err) {
-      console.error("API Error:", err);
-      alert("Failed to connect to backend.");
+
+      // Process final buffer
+      if (buffer.trim()) {
+        try {
+          const msg = JSON.parse(buffer);
+          if (msg.type === "result") {
+            setResult(msg.data);
+            toast.success("Backtest Completed!");
+          }
+        } catch (e) {
+          console.error("Failed to parse final buffer");
+        }
+      }
+    } catch (error: any) {
+      console.error("Backtest Failed:", error);
+      toast.error(error.message || "Failed to run backtest");
     } finally {
       setIsLoading(false);
+      setProgress(100);
     }
   };
+
+  // (Old Simulation Code Removed)
+  /*
+    const progressInterval = setInterval(() => {
+       ...
+    }, 1000);
+  */
+
+
+
 
   // Format currency safely
   const formatCurrency = (val: number | undefined | null) => {
@@ -344,7 +481,100 @@ export function Backtesting() {
 
         <ScrollArea className="flex-1 h-px w-full">
           <form id="backtest-form" onSubmit={form.handleSubmit(onSubmit)} className="p-4 space-y-6">
-            <Accordion type="multiple" defaultValue={["section-a", "section-b"]} className="w-full">
+            <Accordion type="multiple" defaultValue={["data-source", "section-a", "section-b", "section-c", "section-d", "section-e"]} className="w-full">
+
+              {/* SECTION: DATA SOURCE (New) */}
+              <AccordionItem value="data-source">
+                <AccordionTrigger className="text-sm font-semibold hover:no-underline">
+                  Data Source
+                </AccordionTrigger>
+                <AccordionContent className="space-y-4 pt-2">
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium text-muted-foreground">Source Type <span className="text-red-500">*</span></label>
+                    <Select
+                      onValueChange={(val: any) => form.setValue("dataSource", val)}
+                      defaultValue={form.getValues("dataSource")}
+                    >
+                      <SelectTrigger className="h-8 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="KITE_API">Kite Connect API (Live/Recent)</SelectItem>
+                        <SelectItem value="MANUAL">Manual / Local Data (CSV)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* KITE OPTIONS */}
+                  {form.watch("dataSource") === "KITE_API" && (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-medium text-muted-foreground">Candle Interval</label>
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger>
+                              <Info className="h-3 w-3 text-muted-foreground" />
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              <p className="text-xs">
+                                {kiteLimits[form.watch("candleInterval") || "1m"]?.description || "Select an interval to see limits"}
+                              </p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      </div>
+                      <Select
+                        onValueChange={(val) => form.setValue("candleInterval", val)}
+                        defaultValue={form.getValues("candleInterval")}
+                      >
+                        <SelectTrigger className="h-8 text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="1m">1 Minute (Max 30 days)</SelectItem>
+                          <SelectItem value="3m">3 Minute (Max 100 days)</SelectItem>
+                          <SelectItem value="5m">5 Minute (Max 100 days)</SelectItem>
+                          <SelectItem value="15m">15 Minute (Max 180 days)</SelectItem>
+                          <SelectItem value="30m">30 Minute (Max 180 days)</SelectItem>
+                          <SelectItem value="60m">60 Minute (Max 365 days)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
+
+                  {/* MANUAL OPTIONS */}
+                  {form.watch("dataSource") === "MANUAL" && (
+                    <div className="space-y-2">
+                      <div className="space-y-1">
+                        <label className="text-xs font-medium text-muted-foreground">Spot Data File</label>
+                        <Select onValueChange={(val) => form.setValue("spotFile", val)}>
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue placeholder="Select Spot CSV" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {localSources.spot.map((f) => (
+                              <SelectItem key={f.id} value={f.id}>{f.name}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-xs font-medium text-muted-foreground">VIX Data File</label>
+                        <Select onValueChange={(val) => form.setValue("vixFile", val)}>
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue placeholder="Select VIX CSV" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {localSources.vix.map((f) => (
+                              <SelectItem key={f.id} value={f.id}>{f.name}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                  )}
+                </AccordionContent>
+              </AccordionItem>
 
               {/* SECTION A: STRATEGY LOGIC */}
               <AccordionItem value="section-a">
@@ -353,7 +583,21 @@ export function Backtesting() {
                 </AccordionTrigger>
                 <AccordionContent className="space-y-4 pt-2">
                   <div className="space-y-2">
-                    <label className="text-xs font-medium text-muted-foreground">Strategy Type <span className="text-red-500">*</span></label>
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-medium text-muted-foreground">Strategy Type <span className="text-red-500">*</span></label>
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger>
+                            <Info className="h-3 w-3 text-muted-foreground" />
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p className="text-xs max-w-[250px]">
+                              {STRATEGY_DESCRIPTIONS[form.watch("strategyType") || "vwap"] || "Select a strategy"}
+                            </p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
                     <Select
                       onValueChange={(val) => form.setValue("strategyType", val)}
                       defaultValue={form.getValues("strategyType")}
@@ -363,6 +607,7 @@ export function Backtesting() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="vwap">VWAP Momentum (Live)</SelectItem>
+                        <SelectItem value="rsi_reversal">RSI Reversal (New)</SelectItem>
                         <SelectItem value="short_straddle" disabled>Short Straddle (Coming Soon)</SelectItem>
                         <SelectItem value="iron_condor" disabled>Iron Condor (Coming Soon)</SelectItem>
                         <SelectItem value="bull_call" disabled>Bull Call Spread (Coming Soon)</SelectItem>
@@ -418,17 +663,17 @@ export function Backtesting() {
                   <div className="grid grid-cols-2 gap-2">
                     <div className="space-y-1">
                       <label className="text-[10px] uppercase text-muted-foreground font-bold">Start Date <span className="text-red-500">*</span></label>
-                      <Input type="date" className="h-8 text-xs" {...form.register("startDate")} defaultValue="2024-01-01" />
+                      <Input type="date" className="h-8 text-xs" {...form.register("startDate")} />
                     </div>
                     <div className="space-y-1">
                       <label className="text-[10px] uppercase text-muted-foreground font-bold">End Date <span className="text-red-500">*</span></label>
-                      <Input type="date" className="h-8 text-xs" {...form.register("endDate")} defaultValue="2024-12-31" />
+                      <Input type="date" className="h-8 text-xs" {...form.register("endDate")} />
                     </div>
                   </div>
 
                   <div className="space-y-2">
                     <label className="text-xs font-medium text-muted-foreground">Initial Capital (₹) <span className="text-red-500">*</span></label>
-                    <Input type="number" className="h-8 text-xs font-mono" {...form.register("initialCapital")} defaultValue={100000} />
+                    <Input type="number" className="h-8 text-xs font-mono" {...form.register("initialCapital")} />
                   </div>
 
                   <div className="space-y-2">
@@ -454,11 +699,11 @@ export function Backtesting() {
                   <div className="grid grid-cols-2 gap-2">
                     <div className="space-y-1">
                       <label className="text-[10px] uppercase text-muted-foreground font-bold tracking-wider">Entry Time <span className="text-red-500">*</span></label>
-                      <Input type="time" className="h-8 text-xs" {...form.register("entryTime")} />
+                      <Input type="time" className="h-8 text-xs" {...form.register("entryTime")} defaultValue="09:15" />
                     </div>
                     <div className="space-y-1">
                       <label className="text-[10px] uppercase text-muted-foreground font-bold">Exit Time <span className="text-red-500">*</span></label>
-                      <Input type="time" className="h-8 text-xs" {...form.register("exitTime")} />
+                      <Input type="time" className="h-8 text-xs" {...form.register("exitTime")} defaultValue="15:30" />
                     </div>
                   </div>
 
@@ -544,10 +789,11 @@ export function Backtesting() {
 
         {/* STICKY FOOTER ACTION */}
         <div className="p-4 border-t bg-background sticky bottom-0 z-10">
+
           <Button
-            className="w-full font-bold shadow-md"
-            size="lg"
-            onClick={form.handleSubmit(onSubmit)}
+            type="submit"
+            form="backtest-form"
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold flex items-center justify-center gap-2 shadow-lg hover:shadow-xl transition-all h-10 mt-2"
             disabled={isLoading}
           >
             {isLoading ? (
@@ -595,9 +841,16 @@ export function Backtesting() {
             {/* LOADING STATE */}
             {isLoading && (
               <div className="h-full flex items-center justify-center">
-                <div className="flex flex-col items-center gap-4">
-                  <div className="h-12 w-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
-                  <span className="text-lg font-mono animate-pulse">Computing Greeks & PnL...</span>
+                <div className="flex flex-col items-center gap-6 w-full max-w-md p-8">
+                  {/* <div className="h-12 w-12 border-4 border-primary border-t-transparent rounded-full animate-spin" /> */}
+
+                  <div className="space-y-2 w-full text-center">
+                    <div className="text-2xl font-bold">{Math.round(progress)}%</div>
+                    <Progress value={progress} className="h-3 w-full" />
+                    <p className="text-sm text-muted-foreground animate-pulse font-mono">
+                      {progressStatus}
+                    </p>
+                  </div>
                 </div>
               </div>
             )}
@@ -780,7 +1033,7 @@ export function Backtesting() {
                           <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
                           <XAxis dataKey="timestamp" stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(val) => val.split('T')[0]} />
                           <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} domain={['auto', 'auto']} />
-                          <Tooltip contentStyle={{ borderRadius: '8px' }} />
+                          <ChartTooltip contentStyle={{ borderRadius: '8px' }} formatter={(value: any) => formatCurrency(value)} />
                           <Area type="monotone" dataKey="equity" stroke="#16a34a" strokeWidth={2} fill="url(#colorEquity)" />
                         </AreaChart>
                       </ResponsiveContainer>
@@ -796,9 +1049,19 @@ export function Backtesting() {
                             </linearGradient>
                           </defs>
                           <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
-                          <XAxis dataKey="trade" stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} />
+                          <XAxis
+                            dataKey="timestamp"
+                            stroke="hsl(var(--muted-foreground))"
+                            fontSize={12}
+                            tickLine={false}
+                            axisLine={false}
+                            tickFormatter={(value) => {
+                              const date = new Date(value);
+                              return date.getHours() + ':' + date.getMinutes().toString().padStart(2, '0');
+                            }}
+                          />
                           <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} />
-                          <Tooltip contentStyle={{ borderRadius: '8px' }} />
+                          <ChartTooltip contentStyle={{ borderRadius: '8px' }} />
                           <Area type="monotone" dataKey="drawdown" stroke="#ef4444" strokeWidth={2} fill="url(#colorDD)" />
                         </AreaChart>
                       </ResponsiveContainer>
@@ -844,7 +1107,7 @@ export function Backtesting() {
                                   </Badge>
                                 </TableCell>
                                 <TableCell className="text-right font-mono text-xs">{formatCurrency(trade.price)}</TableCell>
-                                <TableCell className="text-right font-mono text-xs">{trade.qty}</TableCell>
+                                <TableCell className="text-right font-mono text-xs">{trade.quantity || '-'}</TableCell>
                                 <TableCell className={cn("text-right font-mono text-xs font-bold", trade.pnl > 0 ? "text-green-600" : trade.pnl < 0 ? "text-red-500" : "")}>
                                   {formatCurrency(trade.pnl)}
                                 </TableCell>

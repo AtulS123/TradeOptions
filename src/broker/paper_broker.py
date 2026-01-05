@@ -14,11 +14,29 @@ class PaperBroker(IVirtualBroker):
     Acts as the 'Source of Truth' for PnL.
     """
     
-    def __init__(self, state_manager: StateManager, slippage_pct: float = 0.0005): # 0.05% default
+    def __init__(self, state_manager: StateManager, risk_manager: Any, slippage_pct: float = 0.0005): # 0.05% default
         self.state_manager = state_manager
+        self.risk_manager = risk_manager
         self.slippage_pct = slippage_pct
         self.positions = {} 
         self.cost_model = CostModel()
+
+    def _parse_symbol(self, symbol: str) -> dict:
+        """
+        Parse option symbol to extract strike and type.
+        Formats supported: NIFTY26350PE, NIFTY 26350 PE, BANKNIFTY52000CE
+        """
+        import re
+        # Remove spaces and extract
+        clean = symbol.replace(" ", "")
+        match = re.search(r'(\d+)(CE|PE)', clean)
+        
+        if match:
+            return {
+                "strike": int(match.group(1)),
+                "option_type": match.group(2)
+            }
+        return {"strike": 0, "option_type": "OPT"}
 
     def authenticate(self):
         return True
@@ -32,6 +50,57 @@ class PaperBroker(IVirtualBroker):
         Executes a paper trade with simulated realism and ATOMIC persistence.
         Supports MARKET, LIMIT, SL, SL-M orders.
         """
+        # ===== VALIDATION LAYER =====
+        validation_errors = []
+        
+        # 1. Quantity validation
+        if quantity <= 0:
+            validation_errors.append("Quantity must be positive")
+        
+        # 2. Symbol validation
+        if not symbol or len(symbol) < 3:
+            validation_errors.append("Invalid symbol")
+        
+        # 3. Side validation
+        if side not in ["BUY", "SELL"]:
+            validation_errors.append("Side must be BUY or SELL")
+        
+        # 4. Order type validation
+        if order_type not in ["MARKET", "LIMIT", "SL", "SL-M"]:
+            validation_errors.append("Invalid order type")
+        
+        # 5. Price validation
+        if order_type in ["MARKET", "LIMIT", "SL"] and price <= 0:
+            validation_errors.append(f"{order_type} order requires valid price")
+        
+        if order_type == "SL-M" and trigger_price <= 0:
+            validation_errors.append("SL-M order requires valid trigger_price")
+        
+        # 6. Capital check (for BUY orders)
+        if side == "BUY" and price > 0:
+            estimated_cost = self.cost_model.calculate_transaction_cost(price, quantity, side)
+            required_capital = (price * quantity) + estimated_cost
+            
+            if required_capital > self.risk_manager.current_capital:
+                validation_errors.append(
+                    f"Insufficient capital. Required: ₹{required_capital:.2f}, "
+                    f"Available: ₹{self.risk_manager.current_capital:.2f}"
+                )
+        
+        # Return rejection if any validation failed
+        if validation_errors:
+            error_msg = "; ".join(validation_errors)
+            logger.error(f"Order validation failed: {error_msg}")
+            return {
+                "order_id": None,
+                "status": "REJECTED",
+                "message": error_msg,
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity
+            }
+        
+        # ===== EXECUTION LOGIC =====
         # 1. Simulate Slippage & Execution Price
         slippage = 0.0
         executed_price = price
@@ -71,7 +140,9 @@ class PaperBroker(IVirtualBroker):
         
         logger.info(f"Simulated Fill: {quantity} {symbol} @ {round(executed_price, 2)} (Slippage: {round(slippage, 2)}, Costs: {costs})")
         
-        # 3. ATOMIC PERSISTENCE (Sole Authority)
+        # Capital is updated via risk_manager.update_pnl() when position closes
+        # NOT during order placement to avoid double-counting
+              
         # 3. ATOMIC PERSISTENCE (Sole Authority)
         if side == "BUY":
             # Check for existing position to Average Up
@@ -96,20 +167,24 @@ class PaperBroker(IVirtualBroker):
                 
             else:
                 # Opening a Position
+                # Parse symbol to extract strike and option type
+                parsed = self._parse_symbol(symbol)
+                
                 # We assume BUY = OPEN for Long Options interactions
                 self.state_manager.add_position(symbol, {
                     "token": token,
                     "symbol": symbol,
+                    "side": side,
                     "quantity": quantity,
                     "entry_price": round(executed_price, 2),
                     "stop_loss": stop_loss, 
                     "target": target,      
-                    "option_type": "CE" if "CE" in symbol else "PE", 
+                    "option_type": parsed["option_type"],
                     "strategy_name": strategy_tag,
                     "timestamp": timestamp,
                     "product": product,       
                     "order_type": order_type,
-                    "strike": 0 
+                    "strike": parsed["strike"]
                 })
         
         # 4. Log Order to History
@@ -159,11 +234,14 @@ class PaperBroker(IVirtualBroker):
         entry_price = pos.get("entry_price", 0.0)
 
         # 2. Execute via Internal Order (for costs/slippage)
-        # We pass side="SELL"
+        # Determine Exit Side (Opposite of Entry)
+        entry_side = pos.get("side", "BUY") # Default to BUY (Long)
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+        
         exec_result = self.place_order(
             symbol=symbol,
             quantity=qty,
-            side="SELL",
+            side=exit_side,
             price=price
         )
         
@@ -171,12 +249,80 @@ class PaperBroker(IVirtualBroker):
         exit_costs = exec_result["costs"]
         
         # 3. Calculate Realized PnL
-        gross_pnl = (exit_price - entry_price) * qty
-        net_pnl = gross_pnl - exit_costs
+        # Handle both LONG (BUY to open) and SHORT (SELL to open) positions
+        if entry_side == "BUY":
+            # Long position: profit when exit > entry
+            gross_pnl = (exit_price - entry_price) * qty
+        else:
+            # Short position: profit when exit < entry
+            gross_pnl = (entry_price - exit_price) * qty
+        
+        # Calculate Detailed Costs
+        exit_breakdown = self.cost_model.get_breakdown(price=exit_price, quantity=qty, side=exit_side)
+        entry_breakdown = self.cost_model.get_breakdown(price=entry_price, quantity=qty, side=entry_side)
+        
+        entry_costs = entry_breakdown["total"]
+        exit_costs = exit_breakdown["total"]
+        
+        net_pnl = gross_pnl - exit_costs - entry_costs
+        pnl_percent = (net_pnl / (entry_price * qty)) * 100 if entry_price > 0 else 0.0
+        
+        # Aggregate Charges for History
+        total_charges = {
+            "brokerage": round(entry_breakdown["brokerage"] + exit_breakdown["brokerage"], 2),
+            "stt": round(entry_breakdown["stt"] + exit_breakdown["stt"], 2),
+            "exchange_charges": round(entry_breakdown["exchange_charges"] + exit_breakdown["exchange_charges"], 2),
+            "stamp_duty": round(entry_breakdown["stamp_duty"] + exit_breakdown["stamp_duty"], 2),
+            "sebi_fees": round(entry_breakdown["sebi_fees"] + exit_breakdown["sebi_fees"], 2),
+            "gst": round(entry_breakdown["gst"] + exit_breakdown["gst"], 2),
+            "total": round(entry_costs + exit_costs, 2)
+        }
+        
+        # Calculate Duration
+        entry_time_str = pos.get("timestamp")
+        duration_str = "0m"
+        exit_time = datetime.now()
+        
+        if entry_time_str:
+             try:
+                 entry_time = datetime.fromisoformat(entry_time_str)
+                 diff = exit_time - entry_time
+                 total_seconds = int(diff.total_seconds())
+                 hours = total_seconds // 3600
+                 minutes = (total_seconds % 3600) // 60
+                 duration_str = f"{hours}h {minutes}m"
+             except:
+                 pass
         
         # 4. Update State (Atomic)
+        # Update both state_manager (persistent) and risk_manager (runtime) to keep in sync
         self.state_manager.update_pnl(net_pnl)
+        self.risk_manager.update_pnl(net_pnl)
         self.state_manager.close_position(symbol)
+        
+        # 5. Log to Closed Trades History
+        # Parse symbol for accurate strike and type
+        parsed = self._parse_symbol(symbol)
+        
+        closed_trade = {
+            "id": f"TRD-{uuid.uuid4().hex[:8]}",
+            "date": exit_time.strftime("%Y-%m-%d %H:%M"),
+            "symbol": symbol,
+            "strike": parsed["strike"],
+            "type": parsed["option_type"],
+            "action": entry_side, # Original Action (BUY/SELL)
+            "quantity": qty,
+            "entryPrice": entry_price,
+            "exitPrice": exit_price,
+            "pnl": round(net_pnl, 2),
+            "pnlPercent": round(pnl_percent, 2),
+            "strategy": pos.get("strategy_name", "Manual"),
+            "exitReason": reason,
+            "duration": duration_str,
+            "mode": "PAPER", # Flag for Frontend
+            "charges": total_charges # Detailed Breakdown
+        }
+        self.state_manager.add_closed_trade(closed_trade)
         
         logger.info(f"Position Closed: {symbol} | Net PnL: {round(net_pnl, 2)} | Reason: {reason}")
         
@@ -191,7 +337,8 @@ class PaperBroker(IVirtualBroker):
 
     def get_pnl(self, symbol: str, current_ltp: float) -> float:
         """
-        Calculates Unrealized PnL based on simulated entry + estimated exit costs.
+        Calculates Unrealized PnL including both entry and exit costs.
+        Handles both LONG (BUY) and SHORT (SELL) positions.
         """
         # Retrieve position from StateManager
         pos = self.state_manager.state.open_positions.get(symbol)
@@ -200,19 +347,35 @@ class PaperBroker(IVirtualBroker):
             
         entry_price = pos.get("entry_price", 0.0)
         qty = pos.get("quantity", 0)
+        entry_side = pos.get("side", "BUY")
         
-        # Gross PnL
-        gross_pnl = (current_ltp - entry_price) * qty
+        # Calculate Gross PnL (handle both long and short)
+        if entry_side == "BUY":
+            # Long position: profit when price goes up
+            gross_pnl = (current_ltp - entry_price) * qty
+        else:
+            # Short position: profit when price goes down
+            gross_pnl = (entry_price - current_ltp) * qty
         
-        # Net PnL (Subtract Exit Costs)
-        # Estimate exit costs at current LTP
-        exit_costs = self.cost_model.calculate_transaction_cost(
-            price=current_ltp,
+        # Calculate both entry and exit costs
+        entry_breakdown = self.cost_model.get_breakdown(
+            price=entry_price,
             quantity=qty,
-            side="SELL"
+            side=entry_side
         )
         
-        return gross_pnl - exit_costs
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+        exit_breakdown = self.cost_model.get_breakdown(
+            price=current_ltp,
+            quantity=qty,
+            side=exit_side
+        )
+        
+        total_costs = entry_breakdown["total"] + exit_breakdown["total"]
+        net_pnl = gross_pnl - total_costs
+        
+        return net_pnl
+
 
     def get_positions(self) -> List[Dict[str, Any]]:
         return list(self.state_manager.state.open_positions.values())

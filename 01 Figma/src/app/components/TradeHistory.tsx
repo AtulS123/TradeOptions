@@ -17,8 +17,21 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "./ui/tabs"
 import { Download, Search, TrendingUp, TrendingDown, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "./ui/tooltip";
 
 interface HistoricalTrade {
   id: string;
@@ -35,182 +48,204 @@ interface HistoricalTrade {
   strategy: string;
   exitReason: string;
   duration: string;
+  mode?: "PAPER" | "LIVE";
+  charges?: {
+    brokerage: number;
+    stt: number;
+    exchange_charges: number;
+    stamp_duty: number;
+    sebi_fees: number;
+    gst: number;
+    total: number;
+  };
 }
 
 export function TradeHistory() {
   const [filterType, setFilterType] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
+  const [trades, setTrades] = useState<HistoricalTrade[]>([]);
+  const [loading, setLoading] = useState(false);
 
-  const handleDeleteOrder = async (orderId: string) => {
-    if (!confirm("Are you sure you want to remove this order from the logs?")) return;
+  // Fetch History
+  const fetchHistory = async () => {
+    setLoading(true);
     try {
-      // Note: Using port 8000 as configured in main.py
-      const res = await fetch(`http://localhost:8000/api/orders/${orderId}`, {
-        method: 'DELETE'
-      });
+      // Point to Python Backend (Port 8001)
+      const res = await fetch("http://localhost:8001/api/history");
       if (res.ok) {
-        alert("Order removed (mock UI won't update unless wired to API)");
-        // In a real app, calls fetchOrders() here.
-      } else {
-        alert("Failed to remove order");
+        const data = await res.json();
+        // Sort by date desc
+        const sorted = data.sort((a: any, b: any) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        setTrades(sorted);
       }
     } catch (error) {
-      console.error(error);
-      alert("Error removing order");
+      console.error("Failed to fetch history:", error);
+    } finally {
+      setLoading(false);
     }
   };
 
-  const historicalTrades: HistoricalTrade[] = [
-    {
-      id: "1",
-      date: "2025-12-14 14:30",
-      symbol: "NIFTY",
-      strike: 21500,
-      type: "CE",
-      action: "BUY",
-      quantity: 50,
-      entryPrice: 145.50,
-      exitPrice: 168.30,
-      pnl: 1140.0,
-      pnlPercent: 15.67,
-      strategy: "Momentum",
-      exitReason: "Target Hit",
-      duration: "2h 15m",
-    },
-    {
-      id: "2",
-      date: "2025-12-14 11:15",
-      symbol: "NIFTY",
-      strike: 21400,
-      type: "PE",
-      action: "SELL",
-      quantity: 25,
-      entryPrice: 89.20,
-      exitPrice: 72.50,
-      pnl: 417.5,
-      pnlPercent: 18.72,
-      strategy: "IV Crush",
-      exitReason: "Target Hit",
-      duration: "1h 45m",
-    },
-    {
-      id: "3",
-      date: "2025-12-13 15:00",
-      symbol: "NIFTY",
-      strike: 21600,
-      type: "CE",
-      action: "BUY",
-      quantity: 75,
-      entryPrice: 132.00,
-      exitPrice: 125.00,
-      pnl: -525.0,
-      pnlPercent: -5.3,
-      strategy: "Breakout",
-      exitReason: "Stop Loss",
-      duration: "3h 20m",
-    },
-    {
-      id: "4",
-      date: "2025-12-13 10:30",
-      symbol: "NIFTY",
-      strike: 21300,
-      type: "PE",
-      action: "BUY",
-      quantity: 100,
-      entryPrice: 78.50,
-      exitPrice: 95.20,
-      pnl: 1670.0,
-      pnlPercent: 21.27,
-      strategy: "Mean Reversion",
-      exitReason: "Target Hit",
-      duration: "4h 10m",
-    },
-    {
-      id: "5",
-      date: "2025-12-12 14:45",
-      symbol: "NIFTY",
-      strike: 21550,
-      type: "CE",
-      action: "SELL",
-      quantity: 50,
-      entryPrice: 155.00,
-      exitPrice: 148.30,
-      pnl: 335.0,
-      pnlPercent: 4.32,
-      strategy: "Theta Decay",
-      exitReason: "Time Exit",
-      duration: "5h 30m",
-    },
-    {
-      id: "6",
-      date: "2025-12-12 09:30",
-      symbol: "NIFTY",
-      strike: 21450,
-      type: "PE",
-      action: "BUY",
-      quantity: 60,
-      entryPrice: 92.00,
-      exitPrice: 85.00,
-      pnl: -420.0,
-      pnlPercent: -7.61,
-      strategy: "Support Bounce",
-      exitReason: "Stop Loss",
-      duration: "2h 00m",
-    },
-    {
-      id: "7",
-      date: "2025-12-11 13:20",
-      symbol: "NIFTY",
-      strike: 21500,
-      type: "CE",
-      action: "BUY",
-      quantity: 80,
-      entryPrice: 138.50,
-      exitPrice: 162.00,
-      pnl: 1880.0,
-      pnlPercent: 16.97,
-      strategy: "Momentum",
-      exitReason: "Target Hit",
-      duration: "3h 15m",
-    },
-    {
-      id: "8",
-      date: "2025-12-11 10:00",
-      symbol: "NIFTY",
-      strike: 21350,
-      type: "PE",
-      action: "SELL",
-      quantity: 40,
-      entryPrice: 102.00,
-      exitPrice: 95.50,
-      pnl: 260.0,
-      pnlPercent: 6.37,
-      strategy: "Range Bound",
-      exitReason: "Target Hit",
-      duration: "1h 30m",
-    },
-  ];
+  useEffect(() => {
+    fetchHistory();
+    // Poll every 5 seconds for updates
+    const interval = setInterval(fetchHistory, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
-  const filteredTrades = historicalTrades.filter((trade) => {
-    const matchesType =
-      filterType === "all" ||
-      (filterType === "profitable" && trade.pnl > 0) ||
-      (filterType === "loss" && trade.pnl < 0);
+  const handleDeleteOrder = async (orderId: string) => {
+    if (!confirm("Are you sure you want to remove this order from the logs?")) return;
+    // Backend delete not fully implemented for history yet, but let's assume we would call an endpoint
+    alert("Delete from history not yet supported by backend API (Requires Order ID lookup in closed_trades)");
+  };
 
-    const matchesSearch =
-      searchTerm === "" ||
-      trade.symbol.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      trade.strategy.toLowerCase().includes(searchTerm.toLowerCase());
+  const getFilteredTrades = (mode: "PAPER" | "LIVE") => {
+    return trades.filter((trade) => {
+      // Mode Filter
+      // Default to PAPER if mode is undefined (legacy support)
+      const tradeMode = trade.mode || "PAPER";
+      if (tradeMode !== mode) return false;
 
-    return matchesType && matchesSearch;
-  });
+      const matchesType =
+        filterType === "all" ||
+        (filterType === "profitable" && trade.pnl > 0) ||
+        (filterType === "loss" && trade.pnl < 0);
 
-  const totalPnL = filteredTrades.reduce((sum, trade) => sum + trade.pnl, 0);
-  const winningTrades = filteredTrades.filter((t) => t.pnl > 0).length;
-  const winRate =
-    filteredTrades.length > 0
-      ? (winningTrades / filteredTrades.length) * 100
-      : 0;
+      const matchesSearch =
+        searchTerm === "" ||
+        trade.symbol.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        trade.strategy.toLowerCase().includes(searchTerm.toLowerCase());
+
+      return matchesType && matchesSearch;
+    });
+  };
+
+  const renderTradeTable = (mode: "PAPER" | "LIVE") => {
+    const filtered = getFilteredTrades(mode);
+
+    // Calculate Stats for this View
+    const totalPnL = filtered.reduce((sum, trade) => sum + trade.pnl, 0);
+    const winningTrades = filtered.filter((t) => t.pnl > 0).length;
+    const winRate = filtered.length > 0 ? (winningTrades / filtered.length) * 100 : 0;
+
+    return (
+      <div className="space-y-4">
+        {/* Summary Cards for this Tab */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Card className="p-4">
+            <div className="text-sm text-muted-foreground">Total P&L ({mode})</div>
+            <div className={`text-2xl font-bold ${totalPnL >= 0 ? "text-green-600" : "text-red-600"}`}>
+              ₹{totalPnL.toFixed(2)}
+            </div>
+          </Card>
+          <Card className="p-4">
+            <div className="text-sm text-muted-foreground">Win Rate</div>
+            <div className="text-2xl font-bold">{winRate.toFixed(1)}%</div>
+            <div className="text-xs text-muted-foreground mt-1">
+              {winningTrades} wins / {filtered.length - winningTrades} losses
+            </div>
+          </Card>
+          <Card className="p-4">
+            <div className="text-sm text-muted-foreground">Avg Trade P&L</div>
+            <div className="text-2xl font-bold">
+              ₹{filtered.length > 0 ? (totalPnL / filtered.length).toFixed(2) : "0.00"}
+            </div>
+          </Card>
+        </div>
+
+        {/* Table */}
+        <Card>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Date/Time</TableHead>
+                <TableHead>Symbol</TableHead>
+                <TableHead>Type</TableHead>
+                <TableHead>Entry</TableHead>
+                <TableHead>Exit</TableHead>
+                <TableHead>Charges</TableHead>
+                <TableHead>Net P&L</TableHead>
+                <TableHead>Strategy</TableHead>
+                <TableHead>Exit Reason</TableHead>
+                <TableHead className="w-[50px]"></TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {filtered.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={11} className="text-center py-8 text-muted-foreground">
+                    No closed trades found in {mode} mode.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                filtered.map((trade) => (
+                  <TableRow key={trade.id}>
+                    <TableCell className="text-sm">{trade.date}</TableCell>
+                    <TableCell>
+                      {trade.symbol}
+                      <div className="text-xs text-muted-foreground">
+                        {trade.action} {trade.quantity}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={trade.action === "BUY" ? "default" : "secondary"}
+                      >
+                        {trade.type}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>₹{trade.entryPrice.toFixed(2)}</TableCell>
+                    <TableCell>₹{trade.exitPrice.toFixed(2)}</TableCell>
+                    <TableCell>
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger className="cursor-help underline decoration-dotted text-muted-foreground">
+                            {trade.charges ? `₹${trade.charges.total.toFixed(2)}` : "-"}
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {trade.charges ? (
+                              <div className="text-xs space-y-1">
+                                <div className="font-semibold border-b pb-1 mb-1">Charge Breakdown</div>
+                                <div className="flex justify-between gap-4"><span>Brokerage:</span> <span>₹{trade.charges.brokerage}</span></div>
+                                <div className="flex justify-between gap-4"><span>STT:</span> <span>₹{trade.charges.stt}</span></div>
+                                <div className="flex justify-between gap-4"><span>Exch Txn:</span> <span>₹{trade.charges.exchange_charges}</span></div>
+                                <div className="flex justify-between gap-4"><span>Stamp Duty:</span> <span>₹{trade.charges.stamp_duty}</span></div>
+                                <div className="flex justify-between gap-4"><span>SEBI:</span> <span>₹{trade.charges.sebi_fees}</span></div>
+                                <div className="flex justify-between gap-4"><span>GST:</span> <span>₹{trade.charges.gst}</span></div>
+                              </div>
+                            ) : ("No details")}
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </TableCell>
+                    <TableCell>
+                      <div className={`flex items-center gap-1 ${trade.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
+                        {trade.pnl >= 0 ? <TrendingUp className="size-4" /> : <TrendingDown className="size-4" />}
+                        <div>
+                          ₹{trade.pnl.toFixed(2)}
+                          <div className="text-xs">
+                            ({trade.pnlPercent > 0 ? "+" : ""}{trade.pnlPercent.toFixed(2)}%)
+                          </div>
+                        </div>
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="outline">{trade.strategy}</Badge>
+                    </TableCell>
+                    <TableCell className="text-sm">{trade.exitReason}</TableCell>
+                    <TableCell>
+                      <Button variant="ghost" size="icon" onClick={() => handleDeleteOrder(trade.id)}>
+                        <Trash2 className="h-4 w-4 text-red-500" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </Card>
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-4">
@@ -218,45 +253,21 @@ export function TradeHistory() {
         <div>
           <h2>Trade History</h2>
           <p className="text-sm text-muted-foreground">
-            {filteredTrades.length} trades
+            View your past performance
           </p>
         </div>
-        <Button variant="outline">
-          <Download className="size-4 mr-2" />
-          Export CSV
-        </Button>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={fetchHistory}>
+            Refresh
+          </Button>
+          <Button variant="outline">
+            <Download className="size-4 mr-2" />
+            Export CSV
+          </Button>
+        </div>
       </div>
 
-      {/* Summary Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <Card className="p-4">
-          <div className="text-sm text-muted-foreground">Total P&L</div>
-          <div
-            className={`${totalPnL >= 0 ? "text-green-600" : "text-red-600"}`}
-          >
-            ₹{totalPnL.toFixed(2)}
-          </div>
-        </Card>
-        <Card className="p-4">
-          <div className="text-sm text-muted-foreground">Win Rate</div>
-          <div>{winRate.toFixed(1)}%</div>
-          <div className="text-xs text-muted-foreground mt-1">
-            {winningTrades} wins / {filteredTrades.length - winningTrades}{" "}
-            losses
-          </div>
-        </Card>
-        <Card className="p-4">
-          <div className="text-sm text-muted-foreground">Avg Trade P&L</div>
-          <div>
-            ₹
-            {filteredTrades.length > 0
-              ? (totalPnL / filteredTrades.length).toFixed(2)
-              : "0.00"}
-          </div>
-        </Card>
-      </div>
-
-      {/* Filters */}
+      {/* Filters (Global) */}
       <Card className="p-4">
         <div className="flex flex-col md:flex-row gap-4">
           <div className="flex-1 relative">
@@ -281,76 +292,22 @@ export function TradeHistory() {
         </div>
       </Card>
 
-      {/* Trades Table */}
-      <Card>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Date/Time</TableHead>
-              <TableHead>Symbol</TableHead>
-              <TableHead>Type</TableHead>
-              <TableHead>Entry</TableHead>
-              <TableHead>Exit</TableHead>
-              <TableHead>P&L</TableHead>
-              <TableHead>Strategy</TableHead>
-              <TableHead>Exit Reason</TableHead>
-              <TableHead>Duration</TableHead>
-              <TableHead className="w-[50px]"></TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {filteredTrades.map((trade) => (
-              <TableRow key={trade.id}>
-                <TableCell className="text-sm">{trade.date}</TableCell>
-                <TableCell>
-                  {trade.symbol} {trade.strike} {trade.type}
-                  <div className="text-xs text-muted-foreground">
-                    {trade.action} {trade.quantity}
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <Badge
-                    variant={trade.action === "BUY" ? "default" : "secondary"}
-                  >
-                    {trade.action}
-                  </Badge>
-                </TableCell>
-                <TableCell>₹{trade.entryPrice.toFixed(2)}</TableCell>
-                <TableCell>₹{trade.exitPrice.toFixed(2)}</TableCell>
-                <TableCell>
-                  <div
-                    className={`flex items-center gap-1 ${trade.pnl >= 0 ? "text-green-600" : "text-red-600"
-                      }`}
-                  >
-                    {trade.pnl >= 0 ? (
-                      <TrendingUp className="size-4" />
-                    ) : (
-                      <TrendingDown className="size-4" />
-                    )}
-                    <div>
-                      ₹{trade.pnl.toFixed(2)}
-                      <div className="text-xs">
-                        ({trade.pnlPercent > 0 ? "+" : ""}
-                        {trade.pnlPercent.toFixed(2)}%)
-                      </div>
-                    </div>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <Badge variant="outline">{trade.strategy}</Badge>
-                </TableCell>
-                <TableCell className="text-sm">{trade.exitReason}</TableCell>
-                <TableCell className="text-sm">{trade.duration}</TableCell>
-                <TableCell>
-                  <Button variant="ghost" size="icon" onClick={() => handleDeleteOrder(trade.id)}>
-                    <Trash2 className="h-4 w-4 text-red-500" />
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </Card>
+      {/* Tabs */}
+      <Tabs defaultValue="paper" className="w-full">
+        <TabsList>
+          <TabsTrigger value="paper">Paper Trades</TabsTrigger>
+          <TabsTrigger value="live">Live Trades</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="paper">
+          {renderTradeTable("PAPER")}
+        </TabsContent>
+
+        <TabsContent value="live">
+          {renderTradeTable("LIVE")}
+        </TabsContent>
+      </Tabs>
+
     </div>
   );
 }

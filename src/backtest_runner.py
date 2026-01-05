@@ -1,7 +1,7 @@
 import pandas as pd
 import logging
 from datetime import datetime, time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 from src.broker.backtest_broker import BacktestBroker
 from strategy_engine.strategies.base import BaseStrategy
 from src.analytics.performance import PerformanceAnalytics
@@ -19,9 +19,11 @@ class BacktestRunner:
         
     def run(self, strategy: BaseStrategy, start_date: str, end_date: str, 
             entry_time_str: str = "09:20", exit_time_str: str = "15:15",
-            stop_loss_pct: float = 0, target_profit_pct: float = 0) -> Dict[str, Any]:
+            stop_loss_pct: float = 0, target_profit_pct: float = 0,
+            dataframe: Optional[pd.DataFrame] = None,
+            progress_callback: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
         """
-        Executes the backtest with new filters.
+        Executes the backtest. Supports custom DataFrame injection.
         """
         logger.info(f"Starting Rule-Based Backtest: {start_date} to {end_date}")
         
@@ -36,8 +38,15 @@ class BacktestRunner:
 
         # 1. Load Data
         try:
-            df = pd.read_csv(self.data_path)
-            df['datetime'] = pd.to_datetime(df['datetime'])
+            if dataframe is not None:
+                df = dataframe.copy()
+                logger.info(f"Using injected DataFrame with {len(df)} rows")
+            else:
+                df = pd.read_csv(self.data_path)
+            
+            # Ensure Datetime
+            if 'datetime' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+                df['datetime'] = pd.to_datetime(df['datetime'])
             
             # INJECT VOLUME IF MISSING (For Synthetic Loading)
             if 'volume' not in df.columns:
@@ -68,17 +77,46 @@ class BacktestRunner:
         
         if df_subset.empty:
             return {"error": "No data found"}
+        
+        # SEED STRATEGY with historical data for warm-up
+        logger.info(f"Seeding strategy '{strategy.name}' with {len(df_subset)} candles")
+        
+        # Build seed DataFrame from available columns
+        seed_df = pd.DataFrame()
+        seed_df['timestamp'] = df_subset['datetime']
+        
+        # For synthetic options data, use nifty_close as OHLC
+        if 'nifty_close' in df_subset.columns:
+            seed_df['close'] = df_subset['nifty_close'].values
+            seed_df['open'] = df_subset['nifty_close'].values  
+            seed_df['high'] = df_subset['nifty_close'].values
+            seed_df['low'] = df_subset['nifty_close'].values
+            seed_df['volume'] = df_subset['volume'].values if 'volume' in df_subset.columns else 10000
+        else:
+            # Use actual OHLC if available
+            seed_df['close'] = df_subset['close'].values
+            seed_df['open'] = df_subset['open'].values if 'open' in df_subset.columns else df_subset['close'].values
+            seed_df['high'] = df_subset['high'].values if 'high' in df_subset.columns else df_subset['close'].values
+            seed_df['low'] = df_subset['low'].values if 'low' in df_subset.columns else df_subset['close'].values
+            seed_df['volume'] = df_subset['volume'].values if 'volume' in df_subset.columns else 10000
+        
+        strategy_seeded = strategy.seed_candles(seed_df)
+        logger.info(f"Strategy seeded: {strategy_seeded}")
             
         equity_curve = []
+        total_rows = len(df_subset)
         
-        for index, row in df_subset.iterrows():
+        for i, (index, row) in enumerate(df_subset.iterrows()):
+            # Progress Update
+            if progress_callback and i % 50 == 0: 
+                pct = int((i / total_rows) * 100)
+                # Map to 50-95% of total progress (0-50% was data fetch)
+                progress_callback(50 + int(pct * 0.45), f"Simulating {row['datetime'].strftime('%Y-%m-%d %H:%M')}")
+
             timestamp = row['datetime'].to_pydatetime() # Convert Timestamp to datetime
             current_time = timestamp.time()
             
             # --- TIME FILTER LOGIC ---
-            # 1. Before Entry Time: No new trades, but holding existing is OK? 
-            # Usually we don't hold overnight in this simple engine.
-            # We skip processing 'Entry' signals if before entry_time
             can_enter = current_time >= entry_time
             
             # 2. Exit Time Gate: Force Close ALL
@@ -92,7 +130,14 @@ class BacktestRunner:
                          p_type = "CE" if "CE" in sym else "PE"
                          curr_price = row['call_price'] if p_type == "CE" else row['put_price']
                          
-                         self.broker.place_order(sym, pos['quantity'], "SELL", curr_price, "TIME_EXIT")
+                         self.broker.place_order(
+                             symbol=sym,
+                             quantity=pos['quantity'],
+                             side="SELL",
+                             price=curr_price,
+                             strategy_tag="TIME_EXIT",
+                             timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                         )
                  
                  # Record Equity and Continue (Don't process strategy signals)
                  total_equity = self.broker.capital + 0 # All closed
@@ -102,6 +147,46 @@ class BacktestRunner:
                     "drawdown": 0
                  })
                  continue
+
+            # --- POSITION-LEVEL SL/TARGET CHECK ---
+            can_enter = True
+            open_positions = self.broker.get_positions()
+            
+            for pos in open_positions[:]:
+                p_type = "CE" if "CE" in pos['symbol'] else "PE"
+                curr_price = row['call_price'] if p_type == "CE" else row['put_price']
+                entry_price = pos['entry_price']
+                
+                # Position P&L % (we bought option, profit when curr > entry)
+                pos_pnl_pct = ((curr_price - entry_price) / entry_price) * 100
+                
+                # Check Position Stop Loss
+                if stop_loss_pct > 0 and pos_pnl_pct <= -stop_loss_pct:
+                    logger.info(f"Position SL: {pos['symbol']} P&L={pos_pnl_pct:.2f}%")
+                    self.broker.place_order(
+                        symbol=pos['symbol'],
+                        quantity=pos['quantity'],
+                        side="SELL",
+                        price=curr_price,
+                        strategy_tag="POSITION_SL",
+                        timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                    can_enter = False
+                    continue
+                
+                # Check Position Target Profit
+                if target_profit_pct > 0 and pos_pnl_pct >= target_profit_pct:
+                    logger.info(f"Position TP: {pos['symbol']} P&L={pos_pnl_pct:.2f}%")
+                    self.broker.place_order(
+                        symbol=pos['symbol'],
+                        quantity=pos['quantity'],
+                        side="SELL",
+                        price=curr_price,
+                        strategy_tag="POSITION_TP",
+                        timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                    can_enter = False
+                    continue
 
             # --- RISK MANAGEMENT (GLOBAL SL/TP) ---
             # Check PnL of open positions
@@ -113,49 +198,40 @@ class BacktestRunner:
                 curr_price = row['call_price'] if p_type == "CE" else row['put_price']
                 u_pnl = self.broker.get_pnl(pos['symbol'], curr_price)
                 unrealized_pnl += u_pnl
-                
-                # Per Position SL (Optional, here we implemented Global Portfolio SL as requested?)
-                # "Generic Risk Rules (SL/TP): ... Global Safety Net"
-                
-            # Calculate Global PnL % for the day/session
-            # Ideally we track daily_pnl. Here we track total account pnl relative to 'capital' at start of run?
-            # Or is it per trade? Request says "current PnL for open positions".
-            # So if we have 5000 profit on 100k capital -> 5%.
             
-            pnl_pct = (unrealized_pnl / self.broker.capital) * 100
+            # Calculate Global PnL %
+            pnl_pct = (unrealized_pnl / self.broker.capital) * 100 if self.broker.capital > 0 else 0
             
-            # Check Gates
-            forced_exit = False
+            # Check SL/TP Gates and immediately exit if triggered
             if stop_loss_pct > 0 and pnl_pct <= -stop_loss_pct:
-                 forced_exit = True
-                 reason = "GLOBAL_SL"
-            elif target_profit_pct > 0 and pnl_pct >= target_profit_pct:
-                forced_exit = True
-                reason = "GLOBAL_TP"
-                if self.broker.data is not None:
-                    df = self.broker.data
-                    print(f"DEBUG: Processing {len(df)} rows in BacktestRunner")
-                    for index, row in df.iterrows():
-                        timestamp = row['datetime']
-                        
-                        # 3. Update Market Price
-                        self.broker.update_market_price(row['call_symbol'], row['call_price'], timestamp)
-                        self.broker.update_market_price(row['put_symbol'], row['put_price'], timestamp)
-                        
-                        # 4. Strategy Signal
-                        signal = strategy.generate_signal(row)
-                        
-                        if signal and signal['action'] != 'HOLD':
-                            print(f"DEBUG: Signal Generated: {signal}")
-                            # Execute Trade Logic...se 
-                 
-            if forced_exit:
+                # Force close all positions
                 for pos in open_positions:
                      p_type = "CE" if "CE" in pos['symbol'] else "PE"
                      curr_price = row['call_price'] if p_type == "CE" else row['put_price']
-                     self.broker.place_order(pos['symbol'], pos['quantity'], "SELL", curr_price, reason)
-                # Skip strategy processing
-                can_enter = False 
+                     self.broker.place_order(
+                         symbol=pos['symbol'],
+                         quantity=pos['quantity'],
+                         side="SELL",
+                         price=curr_price,
+                         strategy_tag="GLOBAL_SL",
+                         timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                     )
+                can_enter = False  # Skip strategy processing
+                
+            elif target_profit_pct > 0 and pnl_pct >= target_profit_pct:
+                # Force close all positions
+                for pos in open_positions:
+                     p_type = "CE" if "CE" in pos['symbol'] else "PE"
+                     curr_price = row['call_price'] if p_type == "CE" else row['put_price']
+                     self.broker.place_order(
+                         symbol=pos['symbol'],
+                         quantity=pos['quantity'],
+                         side="SELL",
+                         price=curr_price,
+                         strategy_tag="GLOBAL_TP",
+                         timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                     )
+                can_enter = False  # Skip strategy processing
 
 
             # --- STRATEGY EXECUTION ---
@@ -163,34 +239,43 @@ class BacktestRunner:
                 # Construct Tick
                 tick_data = {
                     "last_price": row['nifty_close'],
-                    "volume": 10000, 
+                    "volume": row.get('volume', 10000),  # Use actual volume if available
                     "cumulative_volume": 0,
                     "timestamp": timestamp
                 }
                 
                 signal = strategy.process_tick(tick_data)
                 
-                if signal and signal.get("action") == "BUY": # Simplistic: Only handling Long logic from Signal
-                     # Check if already in position logic (Moved from old runner)
-                     # ... (Keep existing simple logic for now, focus on wrapper)
-                     
-                     target_type = "CE" # Default Bullish
-                     # If Strategy says SELL -> Bearish -> Buy PE
-                     # Wait, previous logic: "Mapping: BUY -> Buy CE, SELL -> Buy PE"
-                     # Let's stick to that.
-                     
-                     # Check if we should reverse?
-                     # Allow simple "Only one position" mode for Phase 1
-                     if not self.broker.get_positions():
-                         # SIZING LOGIC
-                         # "If Fixed Lots: Use user input" -> We don't have user input here yet in arg.
-                         # Let's hardcode 50 for now or pass it.
-                         qty = 50 
-                         
-                         entry_price = row['call_price']
-                         symbol = f"NIFTY {row['atm_strike']} CE"
-                         
-                         self.broker.place_order(symbol, qty, "BUY", entry_price, "STRATEGY_ENTRY")
+                if signal and signal.get("action") in ["BUY", "SELL"]:
+                    # Only enter if no position (simple one-position-at-a-time logic)
+                    if not self.broker.get_positions():
+                        # SIGNAL-TO-ORDER TRANSLATION
+                        action = signal.get("action")
+                        
+                        # Determine option type based on signal
+                        # BUY signal -> Bullish -> Buy CE
+                        # SELL signal -> Bearish -> Buy PE
+                        if action == "BUY":
+                            option_type = "CE"
+                            entry_price = row['call_price']
+                        else:  # SELL
+                            option_type = "PE"
+                            entry_price = row['put_price']
+                        
+                        # LOT SIZE: NIFTY = 25 (as of 2025)
+                        lot_size = 25
+                        qty = lot_size  # 1 lot
+                        
+                        symbol = f"NIFTY {int(row['atm_strike'])} {option_type}"
+                        
+                        self.broker.place_order(
+                            symbol=symbol,
+                            quantity=qty,
+                            side="BUY",  # Always BUY to open (we're buying options)
+                            price=entry_price,
+                            strategy_tag="STRATEGY_ENTRY",
+                            timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                        )
 
 
             # --- RECORD EQUITY ---
@@ -220,9 +305,32 @@ class BacktestRunner:
                 for pos in self.broker.get_positions():
                     p_type = "CE" if "CE" in pos['symbol'] else "PE"
                     curr_price = row['call_price'] if p_type == "CE" else row['put_price']
-                    self.broker.place_order(pos['symbol'], pos['quantity'], "SELL", curr_price, "FORCE_EXIT")
+                    self.broker.place_order(
+                        symbol=pos['symbol'],
+                        quantity=pos['quantity'],
+                        side="SELL",
+                        price=curr_price,
+                        strategy_tag="FORCE_EXIT"
+                    )
+            
+            # Record Final Equity State (Post-Exit)
+            final_equity = self.broker.capital # All closed, so Capital is Equity
+            equity_curve.append({
+                "timestamp": timestamp.isoformat(), # Use last known timestamp
+                "equity": round(final_equity, 2),
+                "drawdown": 0
+            })
         
         # 7. Analytics
-        report = PerformanceAnalytics.calculate_metrics(equity_curve, self.broker.trades, self.capital)
-        print(f"DEBUG: BacktestRunner Returning Real Report with {len(self.broker.trades)} trades")
-        return report
+        try:
+            report = PerformanceAnalytics.calculate_metrics(equity_curve, self.broker.trades, self.capital)
+            logger.info(f"Backtest Complete: {len(self.broker.trades)} trades, Final Capital: {self.broker.capital}")
+            logger.info(f"Report Summary: {report.get('summary', {})}")
+            return report
+        except Exception as e:
+            logger.error(f"Analytics calculation failed: {e}", exc_info=True)
+            return {
+                "error": f"Analytics failed: {str(e)}",
+                "trades": self.broker.trades,
+                "equity_curve": equity_curve
+            }

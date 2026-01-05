@@ -1,19 +1,23 @@
 
 import uuid
 from typing import Dict, Any, List
+from datetime import datetime
 from src.interfaces.broker import IVirtualBroker
+from src.broker.cost_model import CostModel
 
 class BacktestBroker(IVirtualBroker):
     """
     In-Memory Broker for Backtesting.
     Does NOT persist to disk/state manager.
     Fills orders immediately at the passed price.
+    Includes realistic transaction costs.
     """
     def __init__(self, initial_capital: float = 100000.0):
         self.trades = [] # History of all executed trades
         self.active_positions = {} # symbol -> {quantity, entry_price, ...}
         self.capital = initial_capital
         self.initial_capital = initial_capital
+        self.cost_model = CostModel()
 
     def authenticate(self):
         return True
@@ -22,11 +26,18 @@ class BacktestBroker(IVirtualBroker):
                    product: str = "MIS", order_type: str = "MARKET", 
                    price: float = 0.0, trigger_price: float = 0.0,
                    stop_loss: float = 0.0, target: float = 0.0,
-                   strategy_tag: str = "BACKTEST") -> Dict[str, Any]:
+                   strategy_tag: str = "BACKTEST", timestamp: str = None) -> Dict[str, Any]:
         
         # Immediate Fill
         executed_price = price
         order_id = f"BT-{len(self.trades) + 1}"
+        
+        # Calculate transaction costs
+        costs = self.cost_model.calculate_transaction_cost(
+            price=executed_price,
+            quantity=quantity,
+            side=side
+        )
         
         # Update Internal State
         # Record for Return
@@ -34,6 +45,9 @@ class BacktestBroker(IVirtualBroker):
 
         if side == "BUY":
             # OPEN Position (Assuming Long only for options for now)
+            # Deduct trade value + costs from capital
+            self.capital -= (executed_price * quantity) + costs
+            
             if symbol in self.active_positions:
                 # Average up
                 curr = self.active_positions[symbol]
@@ -61,8 +75,9 @@ class BacktestBroker(IVirtualBroker):
                 curr = self.active_positions[symbol]
                 remaining = curr["quantity"] - quantity
                 
-                # Realize PnL
-                pnl = (executed_price - curr["entry_price"]) * quantity
+                # Realize PnL (gross - exit costs)
+                gross_pnl = (executed_price - curr["entry_price"]) * quantity
+                pnl = gross_pnl - costs
                 self.capital += pnl
                 pnl_record = pnl
                 
@@ -72,12 +87,14 @@ class BacktestBroker(IVirtualBroker):
                     self.active_positions[symbol]["quantity"] = remaining
 
         trade_record = {
+            "timestamp": timestamp if timestamp else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "order_id": order_id,
             "symbol": symbol,
             "side": side,
             "quantity": quantity,
             "price": executed_price,
             "strategy": strategy_tag,
+            "costs": round(costs, 2),
             "pnl": pnl_record if side == "SELL" else 0.0
         }
         self.trades.append(trade_record)
@@ -87,7 +104,7 @@ class BacktestBroker(IVirtualBroker):
             "status": "COMPLETE",
             "average_price": executed_price,
             "quantity": quantity,
-            "costs": 0.0 # Ignore costs for basic backtest or add later
+            "costs": round(costs, 2)
         }
 
     def get_positions(self) -> List[Dict[str, Any]]:
