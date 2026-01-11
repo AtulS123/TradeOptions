@@ -12,14 +12,17 @@ class VWAPStrategy(BaseStrategy):
     Maintains its own candles and indicators.
     """
     
-    def __init__(self):
+    def __init__(self, timeframe=1, period=20, devs=2.0, volume_multiplier=0.01):
         self._name = "VWAP Momentum"
         self.candles = pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         self.current_candle = None
         self.last_tick_time = None
         
         # Parameters
-        self.volume_multiplier = 0.01 # Relaxed for testing (was 1.5)
+        self.timeframe = timeframe
+        self.period = period
+        self.devs = devs
+        self.volume_multiplier = volume_multiplier
         
     def seed_candles(self, historical_df: pd.DataFrame):
         """
@@ -161,10 +164,10 @@ class VWAPStrategy(BaseStrategy):
         df['vwap'] = df['cum_pairs'] / df['cum_vol'].replace(0, float('nan'))
         
         # EMA 20
-        df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
+        df['ema_20'] = df['close'].ewm(span=self.period, adjust=False).mean()
         
         # Vol SMA
-        df['vol_sma_20'] = df['volume'].rolling(window=20).mean()
+        df['vol_sma_20'] = df['volume'].rolling(window=self.period).mean()
         
         return df.iloc[-1]
 
@@ -208,7 +211,8 @@ class VWAPStrategy(BaseStrategy):
                 "action": action,
                 "token": tick_data.get('instrument_token'),
                 "tag": "VWAP_MOMENTUM",
-                "price": price
+                "price": price,
+                "risk_per_trade": getattr(self, 'risk_per_trade', 1.0)  # Include risk %
             }
             
         return None

@@ -49,6 +49,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   TrendingUp,
+  TrendingDown,
   Activity,
   History,
   Settings2,
@@ -117,7 +118,7 @@ const formSchema = z.object({
 
   // Section E: Advanced Execution
   slippage: z.coerce.number(),
-  commission: z.coerce.number(),
+  // commission removed - now auto-calculated using CostModel
   marketFilter: z.string(),
 });
 
@@ -139,14 +140,14 @@ const DEFAULT_VALUES: FormValues = {
   riskPerTrade: 1.0,
   entryTime: "09:15",
   exitTime: "15:30",
-  targetProfit: 50,
-  stopLoss: 25,
+  targetProfit: 10,
+  stopLoss: 4,
   spotCondition: "any",
-  targetDelta: 0.30,
-  minTheta: 500,
-  maxVega: 1000,
+  targetDelta: undefined,
+  minTheta: undefined,
+  maxVega: undefined,
   slippage: 0.5,
-  commission: 20,
+  // commission removed - auto-calculated
   marketFilter: "all",
 };
 
@@ -162,6 +163,9 @@ const MOCK_RESULTS = {
     sharpe_ratio: 1.85,
     calmar_ratio: 0.93,
     max_drawdown_pct: 0.00,
+    total_brokerage: 2060,
+    total_taxes: 1850,
+    total_costs: 3910
   },
   trade_stats: {
     avg_win: 3251,
@@ -313,11 +317,16 @@ export function Backtesting() {
     const end = new Date(data.endDate);
     const now = new Date();
 
+    // Normalize to midnight for accurate day counting
+    start.setHours(0, 0, 0, 0);
+    end.setHours(0, 0, 0, 0);
+    now.setHours(0, 0, 0, 0);
+
     if (data.dataSource === "KITE_API") {
       const limit = kiteLimits[data.candleInterval || "1m"];
       if (limit) {
         const diffTime = Math.abs(now.getTime() - start.getTime());
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
 
         if (diffDays > limit.max_days) {
           toast.error(`Date Range Error: ${data.candleInterval || "1m"} data is only available for the last ${limit.max_days} days. (Your start date is ${diffDays} days ago)`);
@@ -354,15 +363,12 @@ export function Backtesting() {
           capital: data.initialCapital,
           position_sizing: data.positionSizing,
           risk_per_trade_pct: data.riskPerTrade,
-          max_slippage_pct: data.slippage,
-          commission_per_lot: data.commission
+          max_slippage_pct: data.slippage
         },
         start_date: data.startDate,
         end_date: data.endDate,
         timeframe: data.candleInterval || "1m",
-        data_source: data.dataSource,
-        spot_file: data.spotFile,
-        vix_file: data.vixFile
+        data_source: data.dataSource
       };
 
       const response = await fetch("http://127.0.0.1:8001/api/backtest/run", {
@@ -401,6 +407,8 @@ export function Backtesting() {
                 setProgressStatus(msg.message);
               } else if (msg.type === "result") {
                 console.log("Result received, setting state");
+                console.log("Equity curve length:", msg.data?.equity_curve?.length);
+                console.log("First equity point:", msg.data?.equity_curve?.[0]);
                 setResult(msg.data);
                 toast.success("Backtest Completed Successfully!");
               } else if (msg.type === "error") {
@@ -771,10 +779,6 @@ export function Backtesting() {
                     <label className="text-xs font-medium text-muted-foreground">Slippage (%)</label>
                     <Input type="number" step="0.1" className="h-8 text-xs" {...form.register("slippage")} />
                   </div>
-                  <div className="space-y-2">
-                    <label className="text-xs font-medium text-muted-foreground">Commission / Lot (₹)</label>
-                    <Input type="number" className="h-8 text-xs" {...form.register("commission")} />
-                  </div>
                 </AccordionContent>
               </AccordionItem>
 
@@ -863,9 +867,14 @@ export function Backtesting() {
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                   <Card className="p-4 bg-muted/20">
                     <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Total Return</div>
-                    <div className="text-3xl font-bold text-green-600 mt-1 flex items-baseline gap-2">
+                    <div className={`text-3xl font-bold mt-1 flex items-baseline gap-2 ${(result.summary?.total_return_pct || 0) >= 0 ? 'text-green-600' : 'text-red-600'
+                      }`}>
                       {result.summary?.total_return_pct?.toFixed(2) || "0.00"}%
-                      <TrendingUp className="h-4 w-4" />
+                      {(result.summary?.total_return_pct || 0) >= 0 ? (
+                        <TrendingUp className="h-4 w-4" />
+                      ) : (
+                        <TrendingDown className="h-4 w-4" />
+                      )}
                     </div>
                     <div className="text-sm text-muted-foreground mt-1">
                       {formatCurrency(result.summary?.final_capital)}
@@ -893,7 +902,25 @@ export function Backtesting() {
                   </Card>
 
                   <Card className="p-4 flex flex-col justify-between relatives overflow-hidden">
-                    <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Profit Factor</div>
+                    <div className="flex items-center gap-1">
+                      <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Profit Factor</div>
+                      <HoverCard>
+                        <HoverCardTrigger className="cursor-help">
+                          <Info className="h-3 w-3 text-muted-foreground" />
+                        </HoverCardTrigger>
+                        <HoverCardContent className="w-80">
+                          <div className="space-y-2 text-xs">
+                            <p className="font-semibold">Profit Factor = Total Wins / |Total Losses|</p>
+                            <div className="space-y-1 text-muted-foreground">
+                              <p>• <strong>&gt;2.0</strong>: Excellent (gain ₹2 for every ₹1 lost)</p>
+                              <p>• <strong>1.0-2.0</strong>: Profitable</p>
+                              <p>• <strong>&lt;1.0</strong>: Losing Strategy ❌</p>
+                            </div>
+                            <p className="text-yellow-600 font-medium">Your value: {result.summary?.profit_factor?.toFixed(2) || '0.00'}</p>
+                          </div>
+                        </HoverCardContent>
+                      </HoverCard>
+                    </div>
                     <div className="text-3xl font-bold flex items-center gap-2">
                       {result.summary?.profit_factor || 0}
                       {(result.summary?.profit_factor || 0) > 2 && (
@@ -936,17 +963,73 @@ export function Backtesting() {
                   <Card className="p-4">
                     <h4 className="text-xs font-semibold uppercase text-muted-foreground mb-4">Efficiency Metrics</h4>
                     <div className="space-y-4">
-                      <div className="flex justify-between">
-                        <span className="text-sm">Sharpe Ratio</span>
+                      <div className="flex justify-between items-center">
+                        <HoverCard>
+                          <HoverCardTrigger className="cursor-help flex items-center gap-1">
+                            <span className="text-sm">Sharpe Ratio</span>
+                            <Info className="h-3 w-3 text-muted-foreground" />
+                          </HoverCardTrigger>
+                          <HoverCardContent className="w-80 text-xs">
+                            <div className="space-y-2">
+                              <p className="font-semibold">Risk-Adjusted Return Metric</p>
+                              <p className="font-mono text-[10px] bg-muted p-2 rounded">
+                                (Avg Daily Return / Std Dev) × √252
+                              </p>
+                              <div className="space-y-1">
+                                <p><span className="font-semibold">&lt; 1.0:</span> Poor</p>
+                                <p><span className="font-semibold">1.0 - 2.0:</span> Good</p>
+                                <p><span className="font-semibold">&gt; 2.0:</span> Excellent</p>
+                              </div>
+                              <p className="text-muted-foreground">Higher values indicate better risk-adjusted returns</p>
+                            </div>
+                          </HoverCardContent>
+                        </HoverCard>
                         <span className="font-bold">{result.summary?.sharpe_ratio || 0}</span>
                       </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm">Calmar Ratio</span>
+                      <div className="flex justify-between items-center">
+                        <HoverCard>
+                          <HoverCardTrigger className="cursor-help flex items-center gap-1">
+                            <span className="text-sm">Calmar Ratio</span>
+                            <Info className="h-3 w-3 text-muted-foreground" />
+                          </HoverCardTrigger>
+                          <HoverCardContent className="w-80 text-xs">
+                            <div className="space-y-2">
+                              <p className="font-semibold">Return vs Maximum Drawdown</p>
+                              <p className="font-mono text-[10px] bg-muted p-2 rounded">
+                                Total Return / Max Drawdown %
+                              </p>
+                              <div className="space-y-1">
+                                <p><span className="font-semibold">&lt; 1.0:</span> Returns don't cover drawdown risk</p>
+                                <p><span className="font-semibold">1.0 - 3.0:</span> Good</p>
+                                <p><span className="font-semibold">&gt; 3.0:</span> Excellent</p>
+                              </div>
+                              <p className="text-muted-foreground">Measures profit relative to worst loss</p>
+                            </div>
+                          </HoverCardContent>
+                        </HoverCard>
                         <span className="font-bold">{result.summary?.calmar_ratio || 0}</span>
                       </div>
                       <div className="flex justify-between">
                         <span className="text-sm">Max Drawdown</span>
                         <span className="font-bold text-red-600">{result.summary?.max_drawdown_pct || 0}%</span>
+                      </div>
+                    </div>
+                  </Card>
+
+                  <Card className="p-4">
+                    <h4 className="text-xs font-semibold uppercase text-muted-foreground mb-4">Transaction Costs</h4>
+                    <div className="space-y-4">
+                      <div className="flex justify-between">
+                        <span className="text-sm">Total Brokerage</span>
+                        <span className="font-bold text-orange-600">-₹{result.summary?.total_brokerage?.toLocaleString() || 0}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-sm">Total Taxes & Fees</span>
+                        <span className="font-bold text-orange-600">-₹{result.summary?.total_taxes?.toLocaleString() || 0}</span>
+                      </div>
+                      <div className="flex justify-between border-t pt-4">
+                        <span className="text-sm font-semibold">Total Costs</span>
+                        <span className="font-bold text-red-600">-₹{result.summary?.total_costs?.toLocaleString() || 0}</span>
                       </div>
                     </div>
                   </Card>
@@ -1022,49 +1105,82 @@ export function Backtesting() {
                     </div>
 
                     <TabsContent value="equity" className="h-[300px]">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <AreaChart data={result.equity_curve || []}>
-                          <defs>
-                            <linearGradient id="colorEquity" x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="5%" stopColor="#16a34a" stopOpacity={0.3} />
-                              <stop offset="95%" stopColor="#16a34a" stopOpacity={0} />
-                            </linearGradient>
-                          </defs>
-                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
-                          <XAxis dataKey="timestamp" stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(val) => val.split('T')[0]} />
-                          <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} domain={['auto', 'auto']} />
-                          <ChartTooltip contentStyle={{ borderRadius: '8px' }} formatter={(value: any) => formatCurrency(value)} />
-                          <Area type="monotone" dataKey="equity" stroke="#16a34a" strokeWidth={2} fill="url(#colorEquity)" />
-                        </AreaChart>
-                      </ResponsiveContainer>
+                      {!result.equity_curve || result.equity_curve.length === 0 ? (
+                        <div className="h-full flex items-center justify-center border-2 border-dashed rounded-lg">
+                          <p className="text-muted-foreground text-sm">No equity curve data available</p>
+                        </div>
+                      ) : (
+                        <div style={{ width: '100%', height: '300px' }}>
+                          <ResponsiveContainer width="100%" height={300}>
+                            <AreaChart data={result.equity_curve}>
+                              <defs>
+                                <linearGradient id="colorEquity" x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="5%" stopColor="#16a34a" stopOpacity={0.3} />
+                                  <stop offset="95%" stopColor="#16a34a" stopOpacity={0} />
+                                </linearGradient>
+                              </defs>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
+                              <XAxis
+                                dataKey="timestamp"
+                                stroke="hsl(var(--muted-foreground))"
+                                fontSize={12}
+                                tickLine={false}
+                                axisLine={false}
+                                tickFormatter={(val) => {
+                                  try {
+                                    return val.split('T')[0];
+                                  } catch {
+                                    return val;
+                                  }
+                                }}
+                              />
+                              <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} />
+                              <ChartTooltip contentStyle={{ borderRadius: '8px' }} formatter={(value: any) => formatCurrency(value)} />
+                              <Area type="monotone" dataKey="equity" stroke="#16a34a" strokeWidth={2} fill="url(#colorEquity)" />
+                            </AreaChart>
+                          </ResponsiveContainer>
+                        </div>
+                      )}
                     </TabsContent>
 
                     <TabsContent value="drawdown" className="h-[300px]">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <AreaChart data={chartData}>
-                          <defs>
-                            <linearGradient id="colorDD" x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="5%" stopColor="#ef4444" stopOpacity={0.3} />
-                              <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
-                            </linearGradient>
-                          </defs>
-                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
-                          <XAxis
-                            dataKey="timestamp"
-                            stroke="hsl(var(--muted-foreground))"
-                            fontSize={12}
-                            tickLine={false}
-                            axisLine={false}
-                            tickFormatter={(value) => {
-                              const date = new Date(value);
-                              return date.getHours() + ':' + date.getMinutes().toString().padStart(2, '0');
-                            }}
-                          />
-                          <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} />
-                          <ChartTooltip contentStyle={{ borderRadius: '8px' }} />
-                          <Area type="monotone" dataKey="drawdown" stroke="#ef4444" strokeWidth={2} fill="url(#colorDD)" />
-                        </AreaChart>
-                      </ResponsiveContainer>
+                      {!result.equity_curve || result.equity_curve.length === 0 ? (
+                        <div className="h-full flex items-center justify-center border-2 border-dashed rounded-lg">
+                          <p className="text-muted-foreground text-sm">No drawdown data available</p>
+                        </div>
+                      ) : (
+                        <div style={{ width: '100%', height: '300px' }}>
+                          <ResponsiveContainer width="100%" height={300}>
+                            <AreaChart data={result.equity_curve}>
+                              <defs>
+                                <linearGradient id="colorDD" x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="5%" stopColor="#ef4444" stopOpacity={0.3} />
+                                  <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
+                                </linearGradient>
+                              </defs>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
+                              <XAxis
+                                dataKey="timestamp"
+                                stroke="hsl(var(--muted-foreground))"
+                                fontSize={12}
+                                tickLine={false}
+                                axisLine={false}
+                                tickFormatter={(value) => {
+                                  try {
+                                    const date = new Date(value);
+                                    return date.getHours() + ':' + date.getMinutes().toString().padStart(2, '0');
+                                  } catch {
+                                    return value;
+                                  }
+                                }}
+                              />
+                              <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickLine={false} axisLine={false} />
+                              <ChartTooltip contentStyle={{ borderRadius: '8px' }} />
+                              <Area type="monotone" dataKey="drawdown" stroke="#ef4444" strokeWidth={2} fill="url(#colorDD)" />
+                            </AreaChart>
+                          </ResponsiveContainer>
+                        </div>
+                      )}
                     </TabsContent>
                   </Tabs>
                 </Card>

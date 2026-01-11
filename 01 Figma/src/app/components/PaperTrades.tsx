@@ -3,7 +3,7 @@ import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { TrendingUp, TrendingDown, PlayCircle, StopCircle, XCircle, RefreshCw, Zap, Clock } from "lucide-react";
 import { useState, useEffect } from "react";
-import { StrategyPanel } from "./StrategyPanel";
+import { StrategyMonitor } from "./StrategyMonitor";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./ui/tabs";
 import {
   Table,
@@ -48,7 +48,7 @@ interface AccountSummary {
   capital: number;
   daily_pnl: number;
   kill_switch: boolean;
-  strategies: { name: string; status: string }[];
+  strategies: any[];  // Enhanced to support detailed strategy objects
 }
 
 export function PaperTrades() {
@@ -151,15 +151,16 @@ export function PaperTrades() {
         </Card>
         <Card className="p-4">
           <div className="text-sm text-muted-foreground mb-1">Active Strategies</div>
-          <div className="flex flex-wrap gap-1">
-            {summary?.strategies.map((s, i) => (
-              <Badge key={i} variant="outline" className="text-xs">{s.name}</Badge>
-            )) || "Loading..."}
+          <div className="text-2xl font-bold">
+            {summary?.strategies?.length || 0}
+          </div>
+          <div className="text-xs text-muted-foreground mt-1">
+            {summary?.strategies?.length === 1 ? "strategy deployed" : "strategies deployed"}
           </div>
         </Card>
       </div>
 
-      <StrategyPanel strategies={summary?.strategies || []} />
+      <StrategyMonitor strategies={summary?.strategies || []} />
 
       {/* Tabs: Positions vs Orders */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">

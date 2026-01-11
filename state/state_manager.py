@@ -18,6 +18,7 @@ class TradeState:
     open_positions: Dict[str, dict] = field(default_factory=dict)
     closed_trades: List[dict] = field(default_factory=list) # Log of closed trades with PnL
     orders: List[dict] = field(default_factory=list) # Log of all orders (Open/Executed/Cancelled)
+    deployed_strategies: Dict[str, dict] = field(default_factory=dict) # Deployed strategies
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
 
 class BaseStateStore(ABC):

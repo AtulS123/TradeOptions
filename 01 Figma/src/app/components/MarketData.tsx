@@ -30,6 +30,9 @@ interface OptionRow {
 interface MarketStatus {
   status: string;
   nifty_price: number;
+  change?: number;
+  pChange?: number;
+  market_label?: string;
   pcr: number;
 }
 
@@ -101,6 +104,11 @@ export function MarketData() {
           <CardContent>
             <div className="text-2xl font-bold">
               {marketStatus.nifty_price.toFixed(2)}
+              {marketStatus.change !== undefined && (
+                <span className={`ml-2 text-sm ${marketStatus.change >= 0 ? "text-green-500" : "text-red-500"}`}>
+                  {marketStatus.change > 0 ? "+" : ""}{marketStatus.change.toFixed(2)} ({marketStatus.pChange?.toFixed(2)}%)
+                </span>
+              )}
             </div>
           </CardContent>
         </Card>

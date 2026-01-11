@@ -4,6 +4,7 @@ import { PaperTrades } from "./components/PaperTrades";
 import { Backtesting } from "./components/Backtesting";
 import { TradeHistory } from "./components/TradeHistory";
 import { MarketData } from "./components/MarketData";
+import TelescopeDashboard from "./components/Telescope/TelescopeDashboard";
 import { Card } from "./components/ui/card";
 import {
   Activity,
@@ -11,7 +12,9 @@ import {
   Beaker,
   History,
   BarChart3,
+  Telescope,
 } from "lucide-react";
+import { Toaster } from "sonner";
 
 import { useState, useEffect } from "react";
 
@@ -21,7 +24,7 @@ export default function App() {
   useEffect(() => {
     const fetchStatus = async () => {
       try {
-        const res = await fetch("http://localhost:8000/market-status");
+        const res = await fetch("http://localhost:8001/market-status");
         if (res.ok) {
           const data = await res.json();
           // Backend returns { market_label: "Open" | "Closed", ... }
@@ -73,10 +76,14 @@ export default function App() {
 
       <div className="container mx-auto px-4 py-6">
         <Tabs defaultValue="market" className="w-full">
-          <TabsList className="grid w-full grid-cols-5">
+          <TabsList className="grid w-full grid-cols-6">
             <TabsTrigger value="market" className="flex items-center gap-2">
               <BarChart3 className="size-4" />
               Market Data
+            </TabsTrigger>
+            <TabsTrigger value="telescope" className="flex items-center gap-2">
+              <Telescope className="size-4" />
+              Telescope
             </TabsTrigger>
             <TabsTrigger value="live" className="flex items-center gap-2">
               <Activity className="size-4" />
@@ -100,6 +107,9 @@ export default function App() {
             <TabsContent value="market">
               <MarketData />
             </TabsContent>
+            <TabsContent value="telescope">
+              <TelescopeDashboard />
+            </TabsContent>
 
             <TabsContent value="live">
               <LiveTrades />
@@ -119,6 +129,8 @@ export default function App() {
           </div>
         </Tabs>
       </div>
+      <Toaster />
     </div>
+
   );
 }

@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from urllib.parse import unquote
 
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from kiteconnect import KiteConnect
 from scipy.stats import norm
 import numpy as np
@@ -38,6 +38,12 @@ from src.broker.paper_broker import PaperBroker
 from src.broker.position_monitor import PositionMonitor
 from src.data.trade_logger import TradeLogger
 from src.utils.synthetic import generate_synthetic_feed
+
+# Project Telescope - Multi-Timeframe Pattern Detection
+from src.telescope.historical_loader import HistoricalDataLoader
+from src.telescope.resampler import CandleResampler
+from src.telescope.pattern_scanner import PatternScanner
+from src.telescope.signal_tracker import SignalTracker
 
 # Setup Logging
 
@@ -78,7 +84,302 @@ paper_broker = PaperBroker(state_manager, risk_manager, slippage_pct=0.0005) # 0
 position_monitor = PositionMonitor(paper_broker, state_manager)
 trade_logger = TradeLogger()
 
+# Deployed Strategy Instances (for monitoring state access)
+deployed_strategy_instances = {}  # strategy_id -> strategy_instance
+
+# Telescope - Pattern Detection System
+telescope_loader = HistoricalDataLoader()
+telescope_resampler = CandleResampler()
+telescope_scanner = PatternScanner()
+telescope_tracker = SignalTracker()
+
+def restore_deployed_strategies():
+    """
+    Restore strategy instances from persisted configs on server startup.
+    """
+    global deployed_strategy_instances
+    
+    logger.info(f"Restoring {len(state_manager.state.deployed_strategies)} deployed strategies...")
+    
+    for strategy_id, config in state_manager.state.deployed_strategies.items():
+        try:
+            strategy_type = config.get('type')
+            
+            # Recreate strategy instance based on type
+            if strategy_type == "vwap":
+                strategy = VWAPStrategy()
+            elif strategy_type == "rsi_reversal":
+                strategy = RSIReversalStrategy()
+            elif strategy_type == "gamma_snap":
+                from strategy_engine.strategies.gamma_snap import GammaSnapStrategy
+                strategy = GammaSnapStrategy()
+            elif strategy_type == "test_timer":
+                from strategy_engine.strategies.test_timer import TestTimerStrategy
+                strategy = TestTimerStrategy()
+            else:
+                logger.warning(f"Unknown strategy type: {strategy_type}, skipping {strategy_id}")
+                continue
+            
+            # Store instance
+            deployed_strategy_instances[strategy_id] = strategy
+            logger.info(f"Restored strategy: {strategy_id} ({strategy_type})")
+            
+        except Exception as e:
+            logger.error(f"Failed to restore strategy {strategy_id}: {e}")
+
+async def strategy_tick_loop():
+    """
+    Background loop that calls process_tick() on all deployed strategies.
+    Runs every second to check timers and generate signals.
+    """
+    logger.info("Starting strategy tick loop...")
+    
+    while is_server_running:
+        try:
+            # Get current NIFTY price for strike selection
+            nifty_price = market_status.get('nifty_price', 24000)  # Default fallback
+            
+            # Create a synthetic tick for strategies that don't need market data
+            tick_data = {
+                'timestamp': datetime.now(),
+                'last_price': nifty_price,
+                'instrument_token': None
+            }
+            
+            # Call process_tick on each deployed strategy
+            for strategy_id, strategy in deployed_strategy_instances.items():
+                try:
+                    signal = strategy.process_tick(tick_data)
+                    
+                    if signal and signal.get('action') == 'BUY':
+                        logger.info(f"Strategy {strategy_id} generated BUY signal: {signal}")
+                        
+                        # Execute the trade
+                        try:
+                            # Get strategy config for parameters
+                            config = state_manager.state.deployed_strategies.get(strategy_id, {})
+                            
+                            # Find ATM strike from option chain
+                            if not option_chain_data:
+                                logger.warning("No option chain data available, cannot execute trade")
+                                continue
+                            
+                            # Round to nearest 50 for NIFTY
+                            atm_strike = round(nifty_price / 50) * 50
+                            
+                            # Find the strike in option chain
+                            strike_data = None
+                            for row in option_chain_data:
+                                if row.get('strike') == atm_strike:
+                                    strike_data = row
+                                    break
+                            
+                            if not strike_data:
+                                logger.warning(f"ATM strike {atm_strike} not found in option chain")
+                                continue
+                            
+                            # Get CE (CALL) / PE (PUT) details
+                            option_type = signal.get('option_type', 'CE')
+                            if option_type == 'CE':
+                                ltp = strike_data.get('callLTP', 0)
+                                token = strike_data.get('callToken') or strike_data.get('ce_token')
+                            else:
+                                ltp = strike_data.get('putLTP', 0)
+                                token = strike_data.get('putToken') or strike_data.get('pe_token')
+                            
+                            # Get symbol - try from chain first, then lookup from instrument_df
+                            symbol = None
+                            if option_type == 'CE':
+                                symbol = strike_data.get('callSymbol')
+                            else:
+                                symbol = strike_data.get('putSymbol')
+                            
+                            # If symbol not in chain, lookup from instrument_df using token
+                            if not symbol and token and instrument_df is not None:
+                                try:
+                                    match = instrument_df[instrument_df['instrument_token'] == token]
+                                    if not match.empty:
+                                        symbol = match.iloc[0]['tradingsymbol']
+                                        logger.info(f"Found symbol from instrument_df: {symbol}")
+                                except Exception as lookup_error:
+                                    logger.warning(f"Failed to lookup symbol for token {token}: {lookup_error}")
+                            
+                            if not symbol or not token:
+                                logger.warning(f"Invalid strike data for {atm_strike}")
+                                continue
+                            
+                            # Determine quantity (NIFTY lot size = 65)
+                            lots = config.get('lots_count', 1)
+                            quantity = lots * 65  # Current NIFTY lot size
+                            
+                            # Get strategy tag from signal
+                            strategy_tag = signal.get('tag', 'STRATEGY')
+                            
+                            # Place order via paper broker
+                            order_result = paper_broker.place_order(
+                                symbol=symbol,
+                                quantity=quantity,
+                                side="BUY",
+                                order_type="MARKET",
+                                price=ltp,
+                                product="NRML",
+                                tag=strategy_tag  # Add strategy tag
+                            )
+                            
+                            logger.info(f"Executed trade for {strategy_id}: {order_result}")
+                            
+                            # Notify strategy of position opened
+                            if hasattr(strategy, 'on_position_opened'):
+                                strategy.on_position_opened(symbol, datetime.now())
+                            
+                        except Exception as trade_error:
+                            logger.error(f"Failed to execute trade for {strategy_id}: {trade_error}")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing tick for strategy {strategy_id}: {e}")
+            
+            # Check for exit signals on all strategies
+            for strategy_id, strategy in deployed_strategy_instances.items():
+                try:
+                    # Check if strategy has exit logic
+                    if hasattr(strategy, 'should_exit'):
+                        # Get all open positions from this strategy
+                        for position in state_manager.state.open_positions:
+                            # Check if position should be closed
+                            should_close, reason = strategy.should_exit(position['symbol'])
+                            
+                            if should_close:
+                                logger.info(f"Strategy {strategy_id} exit signal for {position['symbol']}: {reason}")
+                                
+                                # Get current price for closing
+                                current_price = position.get('current_price', position.get('entry_price', 0))
+                                
+                                # Close the position
+                                try:
+                                    close_result = paper_broker.close_position(
+                                        symbol=position['symbol'],
+                                        price=current_price,
+                                        reason=reason
+                                    )
+                                    logger.info(f"Closed position {position['symbol']}: {close_result}")
+                                    
+                                    # Notify strategy
+                                    if hasattr(strategy, 'on_position_closed'):
+                                        strategy.on_position_closed(position['symbol'])
+                                    
+                                except Exception as close_error:
+                                    logger.error(f"Failed to close position {position['symbol']}: {close_error}")
+                                    
+                except Exception as e:
+                    logger.error(f"Error checking exits for strategy {strategy_id}: {e}")
+            
+            await asyncio.sleep(1)  # Check every second
+            
+        except Exception as e:
+            logger.error(f"Error in strategy tick loop: {e}")
+            await asyncio.sleep(1)
+
+
+async def telescope_tick_loop():
+    """
+    Background loop for Project Telescope.
+    - Feeds 1m ticks to resampler
+    - Detects patterns on candle close
+    - Updates signal tracker with current prices
+    """
+    logger.info("Starting Telescope tick loop...")
+    
+    # Preload historical data on startup
+    try:
+        logger.info("Loading historical data for Telescope...")
+        df_historical = telescope_loader.get_latest(365)  # Last 365 days
+        telescope_resampler.preload_historical(df_historical)
+        logger.info(f"Preloaded {len(df_historical)} candles into Telescope")
+    except Exception as e:
+        logger.error(f"Failed to preload historical data: {e}")
+    
+    while is_server_running:
+        try:
+            # LIVE PRICE FEED
+            # Option 1: Get from Kite websocket (when integrated)
+            # nifty_price = kite_stream_data.get('NIFTY_SPOT', 0)
+            
+            # Option 2: Get from option chain if available
+            nifty_price = market_status.get('nifty_price', 0)
+            
+            # Option 3: SIMULATED FEED (for testing/market closed hours)
+            if nifty_price == 0:
+                import random
+                # Base price + random walk
+                base_price = 24500
+                price_change = random.uniform(-50, 50)  # Random movement
+                nifty_price = base_price + price_change
+                market_status['nifty_price'] = nifty_price  # Update for other loops
+                logger.info(f"Telescope: Simulated NIFTY @ {nifty_price:.2f}")
+            
+            # Create 1m tick with realistic OHLC
+            # In production, track actual high/low over the minute
+            tick = {
+                'date': datetime.now(),
+                'open': nifty_price,
+                'high': nifty_price + random.uniform(0, 10),  # Slight variation
+                'low': nifty_price - random.uniform(0, 10),
+                'close': nifty_price,
+                'volume': 0
+            }
+            
+            # Feed to resampler
+            events = telescope_resampler.add_tick(tick)
+            
+            # Process candle close events
+            for event in events:
+                try:
+                    # Run pattern scanner
+                    df = telescope_resampler.get_candles(event.timeframe, 200)
+                    signals = telescope_scanner.scan(df, event.timeframe)
+                    
+                    # Add new signals to tracker
+                    for sig in signals:
+                        # Convert pattern_scanner Signal to signal_tracker Signal
+                        from src.telescope.signal_tracker import Signal as TrackerSignal
+                        tracker_sig = TrackerSignal(
+                            id="",  # Will be set by tracker
+                            pattern_name=sig.pattern_name,
+                            timeframe=sig.timeframe,
+                            timestamp=sig.timestamp,
+                            signal_type=sig.signal_type,
+                            entry_price=sig.entry_price,
+                            stop_loss=sig.stop_loss,
+                            target=sig.target,
+                            candle_index=sig.candle_index,
+                            confidence=sig.confidence,
+                            atr=sig.atr,
+                            metadata=sig.metadata
+                        )
+                        telescope_tracker.add_signal(tracker_sig)
+                        logger.info(f"🎯 NEW SIGNAL: {sig.pattern_name} ({sig.signal_type}) on {sig.timeframe} @ {sig.entry_price}")
+                    
+                except Exception as scan_error:
+                    logger.error(f"Error scanning {event.timeframe}: {scan_error}")
+            
+            # Update all active signals with current price
+            for tf in ['1m', '5m', '15m', '1h', '1d']:
+                telescope_tracker.update_price(tf, nifty_price, datetime.now())
+            
+            await asyncio.sleep(60)  # Update every minute
+            
+        except Exception as e:
+            logger.error(f"Error in telescope tick loop: {e}")
+            await asyncio.sleep(60)
+
 app = FastAPI()
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize strategies and start background loops on server startup."""
+    restore_deployed_strategies()
+    asyncio.create_task(strategy_tick_loop())
+    asyncio.create_task(telescope_tick_loop())  # Start Project Telescope
 
 # CORS
 app.add_middleware(
@@ -92,6 +393,23 @@ app.add_middleware(
 @app.get("/ping")
 def ping():
     return "pong"
+
+@app.get("/market-status")
+def get_market_status():
+    """
+    Returns the current market status with label.
+    """
+    market_label = get_market_state_label()
+    return {
+        "market_label": market_label,
+        "is_open": is_market_open(),
+        "nifty_price": market_status.get("nifty_price", 0.0),
+        "change": market_status.get("change", 0.0),
+        "pChange": market_status.get("pChange", 0.0),
+        "status": market_status.get("status", "Disconnected"),
+        "pcr": market_status.get("pcr", 0.0)
+    }
+
 
 def get_nearest_expiry(df: pd.DataFrame) -> date:
     """Find the nearest upcoming expiry date."""
@@ -645,7 +963,7 @@ class RiskConfig(BaseModel):
     position_sizing: str
     risk_per_trade_pct: float
     max_slippage_pct: float
-    commission_per_lot: float
+    commission_per_lot: float = 20.0  # Default value makes it optional
 
 class BacktestRequest(BaseModel):
     strategy_config: StrategyConfig
@@ -1502,7 +1820,7 @@ class RiskConfig(BaseModel):
     position_sizing: str = "Fixed Lots" # "Fixed Lots", "% Capital", "Kelly"
     risk_per_trade_pct: float = 1.0
     max_slippage_pct: float = 0.5
-    commission_per_lot: float = 20.0
+    commission_per_lot: Optional[float] = Field(default=None)  # Optional - costs calculated by CostModel
 
 class BacktestRequest(BaseModel):
     strategy_config: StrategyConfig
@@ -1526,8 +1844,21 @@ def run_backtest(req: BacktestRequest):
         from src.backtest_runner import BacktestRunner
         from strategy_engine.strategies.vwap import VWAPStrategy # Default for now
         
-        runner = BacktestRunner(initial_capital=req.risk_config.capital)
-        strategy = VWAPStrategy() # We can switch based on req.strategy_config.strategy_type later
+        # Get slippage from request (default 0.5%)
+        slippage_pct = req.risk_config.max_slippage_pct if hasattr(req.risk_config, 'max_slippage_pct') else 0.5
+        
+        # Get strike selection from request
+        strike_selection = req.strategy_config.strike_selection.lower() if hasattr(req.strategy_config, 'strike_selection') else "atm"
+        
+        runner = BacktestRunner(
+            initial_capital=req.risk_config.capital, 
+            slippage_pct=slippage_pct,
+            strike_selection=strike_selection
+        )
+        
+        # Initialize strategy with risk_per_trade parameter
+        strategy = VWAPStrategy()
+        strategy.risk_per_trade = req.risk_config.risk_per_trade_pct  # Pass to strategy
         
         # 2. Run
         print("DEBUG: Calling runner.run()")
@@ -1544,6 +1875,12 @@ def run_backtest(req: BacktestRequest):
         # 3. Return (Result structure already matches via PerformanceAnalytics)
         if "error" in result:
              return {"status": "error", "message": result["error"]}
+        
+        # DEBUG: Check if equity_curve exists
+        equity_curve = result.get("equity_curve", [])
+        print(f"DEBUG: Equity curve has {len(equity_curve)} points")
+        if equity_curve:
+            print(f"DEBUG: First point = {equity_curve[0]}")
              
         return {"status": "success", "data": result}
         
@@ -1575,19 +1912,7 @@ def check_margin(req: MarginRequest):
         "shortfall": max(0, required - available)
     }
 
-@app.get("/api/account-summary")
-def get_account_summary():
-    """Returns account balance and margin usage."""
-    return {
-        "capital": risk_manager.current_capital,
-        "daily_pnl": state_manager.state.daily_pnl,
-        "kill_switch": state_manager.state.kill_switch_active,
-        "strategies": [], # Placeholder for now as StrategyManager isn't fully linked here
-        # Extra useful fields
-        "balance": risk_manager.current_capital,
-        "used_margin": 200000.0 - risk_manager.current_capital, 
-        "open_positions": len(state_manager.state.open_positions)
-    }
+
 
 @app.get("/api/orders")
 def get_orders():
@@ -1741,6 +2066,217 @@ def place_order_endpoint(order: OrderRequest):
         logger.error(f"Place Order Failed: {e}")
         return {"status": "error", "message": str(e)}
 
+# Strategy Deployment Schema
+class DeployStrategyRequest(BaseModel):
+    # Strategy Configuration
+    strategy_type: str  # "vwap", "rsi_reversal", "gamma_snap"
+    underlying: str  # "NIFTY 50", "BANK NIFTY", "FIN NIFTY"
+    strike_selection: str  # "atm", "itm", "otm", "delta"
+    
+    # Position Sizing
+    position_sizing: str  # "fixed", "kelly"
+    risk_per_trade_pct: float
+    lots_count: int
+   
+    # Entry & Exit Rules
+    entry_time: str  # "09:15"
+    exit_time: str  # "15:30"
+    target_profit_pct: Optional[float] = None
+    stop_loss_pct: Optional[float] = None
+    spot_condition: str  # "any", "above_sma", "trending_up", "high_vol"
+    
+    # Greeks & Risk
+    target_delta: Optional[float] = None
+    min_theta: Optional[float] = None
+    max_vega: Optional[float] = None
+    
+    # Optional (inherited from paper trading settings if not provided)
+    initial_capital: Optional[float] = None
+    slippage_pct: Optional[float] = None
+    commission_per_lot: Optional[float] = None
+
+@app.get("/api/account-summary")
+async def get_account_summary():
+    """
+    Returns paper trading account summary including deployed strategies with monitoring state.
+    """
+    try:
+        # Get deployed strategies with real-time monitoring details
+        deployed_strategies = []
+        for strategy_id, config in state_manager.state.deployed_strategies.items():
+            strategy_info = {
+                "id": strategy_id,
+                "name": f"{config.get('type', 'Unknown').upper()} - {config.get('underlying', 'NIFTY')}",
+                "status": config.get('status', 'active'),
+                "type": config.get('type', 'unknown'),
+                "config": {
+                    "entry_time": config.get('entry_time'),
+                    "exit_time": config.get('exit_time'),
+                    "stop_loss_pct": config.get('stop_loss_pct'),
+                    "target_profit_pct": config.get('target_profit_pct'),
+                    "lots_count": config.get('lots_count'),
+                    "underlying": config.get('underlying')
+                }
+            }
+            
+            # Get real-time monitoring state from strategy instance
+            if strategy_id in deployed_strategy_instances:
+                strategy_instance = deployed_strategy_instances[strategy_id]
+                # Check if strategy has get_monitoring_state method
+                if hasattr(strategy_instance, 'get_monitoring_state'):
+                    try:
+                        strategy_info["monitoring"] = strategy_instance.get_monitoring_state()
+                    except Exception as e:
+                        logger.error(f"Failed to get monitoring state for {strategy_id}: {e}")
+                        strategy_info["monitoring"] = {
+                            "entry_conditions": [],
+                            "exit_conditions": [],
+                            "next_action": "Error fetching state"
+                        }
+                else:
+                    strategy_info["monitoring"] = {
+                        "entry_conditions": [],
+                        "exit_conditions": [],
+                        "next_action": "Monitoring..."
+                    }
+            else:
+                strategy_info["monitoring"] = {
+                    "entry_conditions": [],
+                    "exit_conditions": [],
+                    "next_action": "Strategy instance not found"
+                }
+            
+            deployed_strategies.append(strategy_info)
+        
+        return {
+            "capital": risk_manager.current_capital,
+            "daily_pnl": risk_manager.daily_pnl,
+            "kill_switch": risk_manager.kill_switch_active,
+            "strategies": deployed_strategies
+        }
+    except Exception as e:
+        logger.error(f"Failed to get account summary: {e}")
+        return {
+            "capital": 200000.0,
+            "daily_pnl": 0.0,
+            "kill_switch": False,
+            "strategies": []
+        }
+
+@app.post("/deploy-strategy")
+async def deploy_strategy(req: DeployStrategyRequest):
+    """
+    Deploys a new strategy for paper trading with comprehensive parameters.
+    """
+    try:
+        logger.info(f"Strategy Deployment Request: {req.dict()}")
+        
+        # Validate strategy type
+        valid_strategies = ["vwap", "rsi_reversal", "gamma_snap", "test_timer"]
+        if req.strategy_type not in valid_strategies:
+            return {
+                "status": "error",
+                "message": f"Invalid strategy type. Must be one of: {valid_strategies}"
+            }
+        
+        # Use defaults for optional fields
+        initial_capital = req.initial_capital or risk_manager.total_capital
+        slippage_pct = req.slippage_pct or (paper_broker.slippage_pct * 100)
+        commission = req.commission_per_lot or 20.0
+        
+        # Validate capital if provided
+        if initial_capital < 10000:
+            return {
+                "status": "error",
+                "message": "Initial capital must be at least ₹10,000"
+            }
+        
+        # Validate stop loss
+        if not req.stop_loss_pct or req.stop_loss_pct <= 0:
+            return {
+                "status": "error",
+                "message": "Stop loss percentage is required and must be greater than 0"
+            }
+        
+        # Update risk manager with capital
+        risk_manager.total_capital = initial_capital
+        risk_manager.current_capital = initial_capital
+        risk_manager.daily_pnl = 0.0
+        
+        # Update paper broker slippage if provided
+        if req.slippage_pct:
+            paper_broker.slippage_pct = req.slippage_pct / 100.0  # Convert to decimal
+        
+        # Initialize appropriate strategy
+        strategy = None
+        if req.strategy_type == "vwap":
+            strategy = VWAPStrategy()
+        elif req.strategy_type == "rsi_reversal":
+            strategy = RSIReversalStrategy()
+        elif req.strategy_type == "gamma_snap":
+            from strategy_engine.strategies.gamma_snap import GammaSnapStrategy
+            strategy = GammaSnapStrategy()
+        elif req.strategy_type == "test_timer":
+            from strategy_engine.strategies.test_timer import TestTimerStrategy
+            strategy = TestTimerStrategy()
+        
+        if strategy is None:
+            return {
+                "status": "error",
+                "message": f"Failed to initialize strategy: {req.strategy_type}"
+            }
+        
+        # Register strategy with manager AND store instance globally
+        strategy_id = f"{req.strategy_type}_{req.underlying.replace(' ', '_').lower()}_{int(time.time())}"
+        strategy_manager.register_strategy(strategy)
+        
+        # Store strategy instance for monitoring state access
+        deployed_strategy_instances[strategy_id] = strategy
+        
+        # Store strategy configuration in state for later reference
+        strategy_config = {
+            "id": strategy_id,
+            "type": req.strategy_type,
+            "underlying": req.underlying,
+            "strike_selection": req.strike_selection,
+            "entry_time": req.entry_time,
+            "exit_time": req.exit_time,
+            "target_profit_pct": req.target_profit_pct,
+            "stop_loss_pct": req.stop_loss_pct,
+            "initial_capital": initial_capital,
+            "risk_per_trade_pct": req.risk_per_trade_pct,
+            "lots_count": req.lots_count,
+            "slippage_pct": slippage_pct,
+            "commission": commission,
+            "spot_condition": req.spot_condition,
+            "target_delta": req.target_delta,
+            "min_theta": req.min_theta,
+            "max_vega": req.max_vega,
+            "deployed_at": datetime.now().isoformat(),
+            "status": "active"
+        }
+        
+        # Store in state manager
+        state_manager.state.deployed_strategies[strategy_id] = strategy_config
+        state_manager.save()
+        
+        logger.info(f"Strategy {strategy_id} deployed successfully!")
+        
+        return {
+            "status": "success",
+            "message": f"{req.strategy_type.upper()} strategy deployed successfully",
+            "strategy_id": strategy_id,
+            "config": strategy_config
+        }
+        
+    except Exception as e:
+        logger.error(f"Strategy Deployment Failed: {e}")
+        return {
+            "status": "error",
+            "message": f"Deployment failed: {str(e)}"
+        }
+
+
 @app.delete("/api/reset")
 def reset_system_state():
     """
@@ -1754,6 +2290,137 @@ def reset_system_state():
     
     logger.info("System Reset: All trades cleared, capital reset to 200,000")
     return {"status": "success", "message": "System fully reset. Capital: 200,000, P&L: 0"}
+
+
+# ============================================
+# PROJECT TELESCOPE - PATTERN DETECTION API
+# ============================================
+
+@app.get("/api/telescope/candles")
+async def get_telescope_candles(timeframe: str = "1h", lookback: int = 100):
+    """
+    Get OHLCV candles for charting.
+    
+    Params:
+        timeframe: '1m', '5m', '15m', '1h', '1d'
+        lookback: Number of candles to return
+    """
+    try:
+        df = telescope_resampler.get_candles(timeframe, lookback)
+        
+        return {
+            "status": "success",
+            "timeframe": timeframe,
+            "candles": df.to_dict('records')
+        }
+    except Exception as e:
+        logger.error(f"Failed to get candles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/telescope/signals/active")
+async def get_active_signals(timeframe: Optional[str] = None):
+    """
+    Get all active signals, optionally filtered by timeframe.
+    
+    Params:
+        timeframe: Optional filter ('1m', '5m', etc.)
+    """
+    try:
+        signals = telescope_tracker.get_active_signals(timeframe)
+        
+        return {
+            "status": "success",
+            "count": len(signals),
+            "signals": [s.to_dict() for s in signals]
+        }
+    except Exception as e:
+        logger.error(f"Failed to get active signals: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/telescope/signals/history")
+async def get_signal_history(limit: int = 50):
+    """
+    Get recently closed signals.
+    
+    Params:
+        limit: Maximum number to return
+    """
+    try:
+        signals = telescope_tracker.get_historical_signals(limit)
+        
+        return {
+            "status": "success",
+            "count": len(signals),
+            "signals": [s.to_dict() for s in signals]
+        }
+    except Exception as e:
+        logger.error(f"Failed to get signal history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/telescope/stats")
+async def get_telescope_stats():
+    """Get overall Telescope statistics."""
+    try:
+        stats = telescope_tracker.get_stats()
+        
+        # Add data range info
+        start, end, count = telescope_loader.get_data_range()
+        
+        stats["data_range"] = {
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+            "total_candles": count
+        }
+        
+        return {
+            "status": "success",
+            "stats": stats
+        }
+    except Exception as e:
+        logger.error(f"Failed to get stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/telescope/scan")
+async def trigger_pattern_scan(timeframe: str = "1h"):
+    """
+    Manually trigger pattern scan (useful for testing).
+    
+    Params:
+        timeframe: Which timeframe to scan
+    """
+    try:
+        # Get recent candles
+        df = telescope_resampler.get_candles(timeframe, 200)
+        
+        if len(df) < 50:
+            return {
+                "status": "error",
+                "message": f"Insufficient data for {timeframe} (need 50+ candles)"
+            }
+        
+        # Run pattern scanner
+        signals = telescope_scanner.scan(df, timeframe)
+        
+        # Add detected signals to tracker
+        signal_ids = []
+        for sig in signals:
+            sig_id = telescope_tracker.add_signal(sig)
+            signal_ids.append(sig_id)
+        
+        return {
+            "status": "success",
+            "timeframe": timeframe,
+            "patterns_detected": len(signals),
+            "signal_ids": signal_ids,
+            "signals": [s.to_dict() for s in signals]
+        }
+    except Exception as e:
+        logger.error(f"Failed to scan patterns: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

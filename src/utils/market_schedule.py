@@ -27,6 +27,15 @@ NSE_HOLIDAYS = {
     "2025-10-02", # Gandhi Jayanti
     "2025-10-20", # Diwali (Tentative)
     "2025-12-25", # Christmas
+    
+    # 2026 (Projected)
+    "2026-01-26", # Republic Day
+    "2026-04-03", # Good Friday
+    "2026-04-14", # Dr. Ambedkar Jayanti
+    "2026-05-01", # Maharashtra Day
+    "2026-08-15", # Independence Day
+    "2026-10-02", # Gandhi Jayanti
+    "2026-12-25", # Christmas
 }
 
 MARKET_START = time(9, 15)
@@ -53,7 +62,7 @@ def is_market_open() -> bool:
         return False
         
     # Check 3: Time
-    if current_time >= MARKET_START and current_time < MARKET_END:
+    if current_time >= MARKET_START and current_time <= MARKET_END:
         return True
         
     return False

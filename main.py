@@ -14,6 +14,7 @@ import numpy as np
 from src.utils.smart_selector import get_best_strike
 from strategy_engine.strategy_manager import StrategyManager
 from strategy_engine.strategies.vwap import VWAPStrategy
+from strategy_engine.strategies.gamma_snap import GammaSnapStrategy
 from risk.risk_manager import RiskManager
 from state.state_manager import StateManager, JSONStateStore
 from src.broker.paper_broker import PaperBroker
@@ -43,7 +44,8 @@ state_manager = StateManager(state_store)
 
 # Strategy Orchestrator
 strategy_manager = StrategyManager()
-vwap_strategy = VWAPStrategy() # The Plugin
+vwap_strategy = VWAPStrategy() # The Plugin (commented out for Gamma Snap testing)
+gamma_strategy = GammaSnapStrategy() # New Gamma Snap Strategy
 
 # Risk Manager (Gatekeeper)
 risk_manager = RiskManager(total_capital=200000.0)
@@ -153,7 +155,20 @@ async def market_data_loop():
                 continue
                 
             nifty_ltp = spot_quote["NSE:NIFTY 50"]["last_price"]
+            nifty_quote = spot_quote["NSE:NIFTY 50"]
+            
+            # Calculate price change
+            change = nifty_quote.get("change", 0)  # Absolute change from Kite
+            if change == 0 and "ohlc" in nifty_quote:
+                # Fallback: calculate from open price if not provided
+                change = nifty_ltp - nifty_quote["ohlc"]["open"]
+            
+            # Calculate percentage change
+            pchange = (change / (nifty_ltp - change) * 100) if (nifty_ltp - change) != 0 else 0
+            
             market_status["nifty_price"] = nifty_ltp
+            market_status["change"] = round(change, 2)
+            market_status["pChange"] = round(pchange, 2)
             market_status["status"] = "Connected"
             market_status["market_label"] = get_market_state_label()
 
@@ -512,17 +527,23 @@ async def startup_event():
                 # Convert to DF
                 hist_df = pd.DataFrame(historical_data)
                 
-                # Seed VWAP (Register strategy first!)
-                strategy_manager.register_strategy(vwap_strategy) # Plug IN before seeding
-                vwap_strategy.seed_candles(hist_df)
+                # Seed Gamma Snap (Register strategy first!)
+                # Note: Commenting out VWAP to test Gamma Snap in isolation
+                # strategy_manager.register_strategy(vwap_strategy) # Plug IN before seeding
+                # vwap_strategy.seed_candles(hist_df)
+                
+                strategy_manager.register_strategy(gamma_strategy) # Active: Gamma Snap
+                gamma_strategy.seed_candles(hist_df)
             else:
-                logger.info("Market not open yet, skipping VWAP seed.")
-                strategy_manager.register_strategy(vwap_strategy)
+                logger.info("Market not open yet, skipping strategy seed.")
+                # strategy_manager.register_strategy(vwap_strategy)
+                strategy_manager.register_strategy(gamma_strategy)
 
         except Exception as e:
-            logger.error(f"Failed to seed VWAP: {e}")
+            logger.error(f"Failed to seed strategy: {e}")
             # Ensure strategy registered even if seed fails
-            strategy_manager.register_strategy(vwap_strategy)
+            # strategy_manager.register_strategy(vwap_strategy)
+            strategy_manager.register_strategy(gamma_strategy)
 
         # Start background task
         asyncio.create_task(market_data_loop())

@@ -12,10 +12,14 @@ class BacktestRunner:
     """
     Runs the simulation with strict rules for Time, Risk, and Sizing.
     """
-    def __init__(self, data_path: str = "data/backtest/synthetic_options.csv", initial_capital: float = 100000.0):
+    def __init__(self, data_path: str = "data/backtest/synthetic_options.csv", 
+                 initial_capital: float = 100000.0, 
+                 slippage_pct: float = 0.5,
+                 strike_selection: str = "atm"):
         self.data_path = data_path
-        self.broker = BacktestBroker(initial_capital=initial_capital)
+        self.broker = BacktestBroker(initial_capital=initial_capital, slippage_pct=slippage_pct)
         self.capital = initial_capital
+        self.strike_selection = strike_selection.lower()  # "atm", "itm", "otm"
         
     def run(self, strategy: BaseStrategy, start_date: str, end_date: str, 
             entry_time_str: str = "09:20", exit_time_str: str = "15:15",
@@ -149,7 +153,6 @@ class BacktestRunner:
                  continue
 
             # --- POSITION-LEVEL SL/TARGET CHECK ---
-            can_enter = True
             open_positions = self.broker.get_positions()
             
             for pos in open_positions[:]:
@@ -262,11 +265,54 @@ class BacktestRunner:
                             option_type = "PE"
                             entry_price = row['put_price']
                         
-                        # LOT SIZE: NIFTY = 25 (as of 2025)
-                        lot_size = 25
-                        qty = lot_size  # 1 lot
+                        # POSITION SIZING BASED ON RISK
+                        # LOT SIZE: NIFTY = 65 (correct as of 2025+)
+                        lot_size = 65
                         
-                        symbol = f"NIFTY {int(row['atm_strike'])} {option_type}"
+                        # Calculate position size based on risk_per_trade
+                        # Default to 1% if not provided
+                        risk_pct = signal.get("risk_per_trade", 1.0)  # From strategy config
+                        
+                        # Risk Amount = Capital * Risk %
+                        risk_amount = self.broker.capital * (risk_pct / 100)
+                        
+                        # Quantity = Risk Amount / Option Premium
+                        # Then round to nearest lot
+                        if entry_price > 0:
+                            theoretical_qty = risk_amount / entry_price
+                            num_lots = max(1, round(theoretical_qty / lot_size))  # Min 1 lot
+                            qty = num_lots * lot_size
+                        else:
+                            # Fallback to 1 lot if price is invalid
+                            qty = lot_size
+                        
+                        logger.info(f"Position Sizing: Risk={risk_pct}%, Amount=₹{risk_amount:.0f}, Price=₹{entry_price:.2f}, Lots={num_lots}, Qty={qty}")
+                        
+                        # STRIKE SELECTION LOGIC
+                        atm_strike = int(row['atm_strike'])
+                        nifty_price = row['nifty_close']
+                        
+                        # Determine strike based on selection
+                        if self.strike_selection == "itm":
+                            # ITM: Go 1-2 strikes in the money
+                            # For CE: strike below CMP, For PE: strike above CMP
+                            if option_type == "CE":
+                                selected_strike = atm_strike - 100  # 2 strikes ITM for CE
+                            else:  # PE
+                                selected_strike = atm_strike + 100  # 2 strikes ITM for PE
+                        elif self.strike_selection == "otm":
+                            # OTM: Go 1-2 strikes out of money
+                            # For CE: strike above CMP, For PE: strike below CMP
+                            if option_type == "CE":
+                                selected_strike = atm_strike + 100  # 2 strikes OTM for CE
+                            else:  # PE
+                                selected_strike = atm_strike - 100  # 2 strikes OTM for PE
+                        else:  # atm (default)
+                            selected_strike = atm_strike
+                        
+                        logger.info(f"Strike Selection: {self.strike_selection.upper()} → Strike={selected_strike} (ATM={atm_strike}, CMP={nifty_price:.2f})")
+                        
+                        symbol = f"NIFTY {selected_strike} {option_type}"
                         
                         self.broker.place_order(
                             symbol=symbol,
@@ -323,7 +369,13 @@ class BacktestRunner:
         
         # 7. Analytics
         try:
-            report = PerformanceAnalytics.calculate_metrics(equity_curve, self.broker.trades, self.capital)
+            report = PerformanceAnalytics.calculate_metrics(
+                equity_curve, 
+                self.broker.trades, 
+                self.capital,
+                total_brokerage=self.broker.total_brokerage,
+                total_taxes=self.broker.total_taxes
+            )
             logger.info(f"Backtest Complete: {len(self.broker.trades)} trades, Final Capital: {self.broker.capital}")
             logger.info(f"Report Summary: {report.get('summary', {})}")
             return report
